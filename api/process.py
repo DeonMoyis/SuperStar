@@ -1,6 +1,7 @@
 import time
 
 from api.config import GlobalConst as gc
+from api.playback import FORCED_SPEED
 
 
 def sec2time(seconds: int) -> str:
@@ -34,11 +35,13 @@ def show_progress(task_name: str, start_position: int, duration: int,
         start_position: 起始位置（以秒为单位）
         duration: 任务持续时间（以秒为单位）
         total_length: 任务总长度（以秒为单位）
-        speed: 任务执行速度
+        speed: 任务执行速度（已固定为 1.0，传其他值会被忽略）
         
     Returns:
         None
     """
+    # 1 倍速固定, 这个辅助函数只用于展示, 同样不允许倍速
+    speed = FORCED_SPEED
     start_time = time.time()
     expected_end_time = start_time + (duration / speed)
     

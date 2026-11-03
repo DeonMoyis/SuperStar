@@ -16,6 +16,7 @@
 - `font_decoder.py`: 字体解码器
 - `logger.py`: 日志功能
 - `notification.py`: 通知功能
+- `playback.py`: 播放节奏控制（倍速强制 1x、单视频串行闸门、真实耗时统计）
 - `process.py`: 进度显示工具
 - `captcha.py`: 验证码识别模块（未启用）
 - `live.py`: 直播任务处理

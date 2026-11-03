@@ -28,6 +28,7 @@ from api.logger import configure_console_logger, logger
 from api.notification import Notification
 from api.live import Live
 from api.live_process import LiveProcessor
+from api.playback import FORCED_SPEED, normalize_speed, playback_gate
 
 class ChapterResult(enum.Enum):
     SUCCESS=0,
@@ -72,10 +73,12 @@ def parse_args():
         "-l", "--list", type=str, default=None, help="要学习的课程ID列表, 以 , 分隔"
     )
     parser.add_argument(
-        "-s", "--speed", type=float, default=1.0, help="视频播放倍速 (默认1, 最大2)"
+        "-s", "--speed", type=float, default=1.0,
+        help="已废弃: 播放倍速固定为 1 倍速(超星时长校验严格, 倍速有漏任务点风险), 此参数仅为兼容旧命令保留"
     )
     parser.add_argument(
-        "-j", "--jobs", type=int, default=4, help="同时进行的章节数 (默认4, 如果一个章节有多个任务点，不会限制同时处理任务点的数量)"
+        "-j", "--jobs", type=int, default=1,
+        help="同时处理的章节数 (默认1=顺序处理; 视频播放已全局串行, 调大只对文档/测验类任务点有加速作用)"
     )
 
     parser.add_argument(
@@ -214,8 +217,8 @@ def build_config_from_args(args):
         "username": args.username,
         "password": args.password,
         "course_list": [item.strip() for item in args.list.split(",") if item.strip()] if args.list else None,
-        "speed": args.speed if args.speed else 1.0,
-        "jobs": args.jobs,
+        "speed": FORCED_SPEED,
+        "jobs": args.jobs if args.jobs else 1,
         "notopen_action": args.notopen_action if args.notopen_action else "retry",
         "verbose": args.verbose,
         "answer_only": getattr(args, "answer_only", False),
@@ -380,11 +383,12 @@ class JobProcessor:
 
     def __init__(self, chaoxing: Chaoxing, course: dict[str, Any], tasks: list[ChapterTask], config: dict[str, Any]):
         if "jobs" not in config or not config["jobs"]:
-            config["jobs"] = 4
+            config["jobs"] = 1
         
         self.chaoxing = chaoxing
         self.course = course
-        self.speed = config["speed"]
+        # 倍速固定 1.0; 即使外部绕过了 init_config 也拉不上去
+        self.speed = normalize_speed(config.get("speed", FORCED_SPEED))
         self.max_tries = 5
         self.tasks = tasks
         self.failed_tasks: list[ChapterTask] = []
@@ -553,6 +557,7 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     p = JobProcessor(chaoxing, course, tasks, config)
     p.run()
 
+    logger.info(f"课程 {course['title']} 处理结束 | {playback_gate.stats()}")
 
     tqdm.format_sizeof = _old_format_sizeof
 
@@ -608,9 +613,18 @@ def main():
         common_config, tiku_config, notification_config = init_config()
         configure_console_logger("DEBUG" if common_config.get("verbose", False) else "INFO")
         
-        # 强制播放按照配置文件调节
-        common_config["speed"] = min(2.0, max(1.0, common_config.get("speed", 1.0)))
+        # 播放节奏: 倍速固定 1 倍速, 视频全局串行; 配置里写别的值也一律拉回
+        common_config["speed"] = normalize_speed(common_config.get("speed", 1.0))
+        jobs = common_config.get("jobs", 1)
+        try:
+            jobs = int(jobs)
+        except (TypeError, ValueError):
+            jobs = 1
+        common_config["jobs"] = max(1, jobs)
         common_config["notopen_action"] = common_config.get("notopen_action", "retry")
+        logger.info(
+            f"播放节奏: {FORCED_SPEED:g} 倍速, 视频串行播放, 章节并发数 {common_config['jobs']}"
+        )
 
         # 初始化 DeepSeek(没填 api_key 会自动关闭, 不影响其余功能)
         ai_config = normalize_ai_config(common_config.get("ai"))

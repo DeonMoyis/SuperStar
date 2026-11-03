@@ -28,10 +28,34 @@ from api.decode import (
     decode_questions_info,
 )
 from api.exceptions import MaxRetryExceeded
+from api.playback import FORCED_SPEED, playback_gate, format_duration
 
 
 def get_timestamp():
     return str(int(time.time() * 1000))
+
+
+def normalize_play_time(value, duration: float) -> float:
+    """把播放进度统一成「秒」
+
+    超星不同接口的 playTime 单位并不一致: 任务点列表里是毫秒(毫秒 -> 秒的
+    除法在 study_video 里做), 而 /ananas/status 返回的可能是毫秒也可能是秒。
+    这里做一次自适应: 超过总时长只可能是毫秒, 否则原样返回。
+
+    这个单位搞错的后果很直接 —— 几百万毫秒被当成秒, 会被 min(duration, ...)
+    立刻截断成"已播完", 视频几秒钟就"看完"了, 任务点自然容易漏。
+    """
+    try:
+        value = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if value <= 0:
+        return 0.0
+    if duration and value > duration:
+        converted = value / 1000.0
+        if converted <= duration:
+            return converted
+    return value
 
 
 class SessionManager:
@@ -571,14 +595,9 @@ class Chaoxing:
 
         duration = int(_video_info["duration"])
         play_time = int(_job["playTime"]) // 1000
-        last_log_time = 0
-        last_iter = time.time()
         wait_time = int(random.uniform(30, 90))
 
         logger.info(f"开始任务: {_job['name']}, 总时长: {duration}s, 已进行: {play_time}s")
-
-        pbar = tqdm(total=duration, initial=play_time, desc=_job["name"],
-                    unit_scale=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')
 
         forbidden_retry = 0
         max_forbidden_retry = 2
@@ -589,51 +608,89 @@ class Chaoxing:
             logger.info("任务瞬间完成: {}", _job['name'])
             return StudyResult.SUCCESS
 
-        while not passed:
-            # Sometimes the last request needs to be sent several times to complete the task
-            if play_time - last_log_time >= wait_time or play_time == duration:
+        # 倍速统一由 api/playback.py 钉死为 1.0, 外部传入的 _speed 一律忽略
+        _speed = FORCED_SPEED
 
-                passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
-                                                        int(play_time), _type, headers=headers)
-
-                if state == 403:
-                    if forbidden_retry >= max_forbidden_retry:
-                        logger.warning("403重试失败, 跳过当前任务")
-                        return StudyResult.FORBIDDEN
-                    forbidden_retry += 1
-                    logger.warning(
-                        "出现403报错, 正在尝试刷新会话状态 (第{}次)",
-                        forbidden_retry,
-                    )
-                    time.sleep(random.uniform(2, 4))
-                    refreshed_meta = self._recover_after_forbidden(_session, _job, _type)
-                    if refreshed_meta:
-                        # FIXME: if those keys aren't present, it should be considered an error rather than falling back
-                        _dtoken = refreshed_meta.get("dtoken", _dtoken)
-                        _duration = refreshed_meta.get("duration", duration)
-                        play_time = refreshed_meta.get("playTime", play_time)
-
-                        logger.debug("Refreshed token: {}, duration: {}, play time: {}", _dtoken, _duration, play_time)
-                        continue
-
-                elif not passed and state != 200:
-                    return StudyResult.ERROR
-
-                wait_time = int(random.uniform(30, 90))
-                last_log_time = play_time
-
-                logger.trace("Progress logged")
-
-            # Uploading the progress takes time, we assume that the video is still playing in the background, this manually calculates the time elapsed
-            dt = (time.time() - last_iter) * _speed
+        # 全局播放位: 同一时刻只允许一个视频推进进度。
+        # 并发播放会让真实耗时变成总时长的 1/N, 效果等同倍速, 同样有漏任务点的风险。
+        # last_iter 必须在拿到播放位之后再初始化, 否则排队等待的时间会被当成
+        # "视频正在播放", 进度一次性跳一大截。
+        with playback_gate.hold(_job['name']):
             last_iter = time.time()
-            play_time = min(duration, play_time + dt)
+            play_started_at = last_iter
+            start_play_time = play_time
+            last_log_time = 0
 
-            pbar.n = int(play_time)
-            pbar.refresh()
-            time.sleep(gc.THRESHOLD)
+            pbar = tqdm(total=duration, initial=play_time, desc=_job["name"],
+                        unit_scale=True, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}')
+            try:
+                while not passed:
+                    # Sometimes the last request needs to be sent several times to complete the task
+                    if play_time - last_log_time >= wait_time or play_time == duration:
 
-        logger.info("任务完成: {}", _job['name'])
+                        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
+                                                                int(play_time), _type, headers=headers)
+
+                        if state == 403:
+                            if forbidden_retry >= max_forbidden_retry:
+                                logger.warning("403重试失败, 跳过当前任务")
+                                return StudyResult.FORBIDDEN
+                            forbidden_retry += 1
+                            logger.warning(
+                                "出现403报错, 正在尝试刷新会话状态 (第{}次)",
+                                forbidden_retry,
+                            )
+                            time.sleep(random.uniform(2, 4))
+                            refreshed_meta = self._recover_after_forbidden(_session, _job, _type)
+                            if refreshed_meta:
+                                _dtoken = refreshed_meta.get("dtoken", _dtoken)
+                                # 刷新后时长可能变化, 用新值覆盖, 否则会用旧时长去判完成
+                                new_duration = refreshed_meta.get("duration")
+                                if new_duration:
+                                    duration = int(new_duration)
+                                play_time = normalize_play_time(
+                                    refreshed_meta.get("playTime", play_time), duration
+                                )
+                                play_time = min(play_time, duration)
+
+                                logger.debug("Refreshed token: {}, duration: {}, play time: {}", _dtoken, duration, play_time)
+                                continue
+
+                        elif not passed and state != 200:
+                            return StudyResult.ERROR
+
+                        wait_time = int(random.uniform(30, 90))
+                        last_log_time = play_time
+
+                        logger.trace("Progress logged")
+
+                    # Uploading the progress takes time, we assume that the video is still playing in the background, this manually calculates the time elapsed
+                    dt = (time.time() - last_iter) * _speed
+                    last_iter = time.time()
+                    play_time = min(duration, play_time + dt)
+
+                    pbar.n = int(play_time)
+                    pbar.refresh()
+                    # 已经播完就不用再等这一轮, 下一轮会立刻上报完成
+                    if play_time < duration:
+                        time.sleep(gc.THRESHOLD)
+            finally:
+                pbar.close()
+
+            wall_clock = time.time() - play_started_at
+            logger.info(
+                "任务完成: {} | 视频时长 {} | 起始进度 {} | 本次实际耗时 {}",
+                _job['name'], format_duration(duration), format_duration(start_play_time),
+                format_duration(wall_clock),
+            )
+            # 实际耗时明显短于待播时长时给出提示, 方便定位是"起点已有进度"还是"服务端提前放行"
+            remaining = max(0, duration - start_play_time)
+            if remaining > 60 and wall_clock < remaining * 0.5:
+                logger.warning(
+                    "本次耗时 {} 明显短于待播时长 {}, 若任务点未计入请检查是否有异常放行",
+                    format_duration(wall_clock), format_duration(remaining),
+                )
+
         return StudyResult.SUCCESS
 
     def study_document(self, _course, _job) -> StudyResult:

@@ -3,6 +3,7 @@ import time
 from api.config import GlobalConst as gc
 from api.live import Live
 from api.logger import logger
+from api.playback import FORCED_SPEED
 import time
 import threading
 
@@ -10,6 +11,8 @@ class LiveProcessor:
     @staticmethod
     def run_live(live: Live, speed: float = 1.0):
         """循环提交直播时长，直到达到总时长"""
+        # 一倍速固定: 直播时长同样按真实时间推进, 倍速刷容易被判定异常
+        speed = FORCED_SPEED
         # 获取直播状态（包含总时长）
         live_status = live.get_status()
         if not live_status:
@@ -26,10 +29,10 @@ class LiveProcessor:
             logger.error(f"解析直播时长失败: {str(e)}")
             return False
 
-        # 根据播放速度调整所需时间
+        # 根据播放速度调整所需时间(倍速已固定为 1.0, 此处除法仅为保留原有结构)
         adjusted_duration = duration / speed
         total_minutes = (int(adjusted_duration) + 59) // 60  # 转换为分钟（向上取整）
-        logger.info(f"开始刷取直播'{live.name}'，总时长{total_minutes}分钟（已根据倍速调整）")
+        logger.info(f"开始刷取直播'{live.name}'，总时长{total_minutes}分钟")
 
         # 循环提交时长（每59秒一次，模拟持续观看）
         for i in range(total_minutes):
