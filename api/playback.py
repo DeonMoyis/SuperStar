@@ -73,22 +73,37 @@ class PlaybackGate:
         return self._holder
 
     @contextmanager
-    def hold(self, name: str = ""):
+    def hold(self, name: str = "", should_stop=None):
+        """占用播放位
+
+        Args:
+            name: 任务名, 仅用于日志
+            should_stop: 可选回调, 返回 True 表示不必再等播放位了(例如到达运行时长上限)。
+                排队中被拒绝时 yield False, 调用方据此跳过该视频;
+                已经在播放的视频不受影响, 会正常播完。
+
+        Yields:
+            bool: 是否成功拿到播放位
+        """
         waited = 0.0
         announced = False
-        # 每 5 秒探一次, 既能及时拿到播放位, 又能在排队时给出可见反馈
-        while not self._sem.acquire(timeout=5):
-            waited += 5
+        # 每 1 秒探一次: 既能及时拿到播放位, 也能在收到停止信号后 1 秒内退出等待
+        while not self._sem.acquire(timeout=1):
+            waited += 1
+            if should_stop is not None and should_stop():
+                logger.info(f"不再等待播放位, 跳过该视频: {name}")
+                yield False
+                return
             if not announced:
                 logger.info(f"当前有视频正在播放, 排队等待: {name}")
                 announced = True
-            elif int(waited) % 60 < 5:
+            elif int(waited) % 60 < 2:
                 logger.info(f"仍在排队等待播放位(已等待 {waited:.0f}s): {name}")
 
         self._holder = name
         started = time.time()
         try:
-            yield
+            yield True
         finally:
             elapsed = time.time() - started
             with self._stat_lock:

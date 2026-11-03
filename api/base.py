@@ -29,6 +29,7 @@ from api.decode import (
 )
 from api.exceptions import MaxRetryExceeded
 from api.playback import FORCED_SPEED, playback_gate, format_duration
+from api.runtime_budget import runtime_budget
 
 
 def get_timestamp():
@@ -132,12 +133,18 @@ class StudyResult(Enum):
     FORBIDDEN = 1  # 403
     ERROR = 2
     TIMEOUT = 3
+    # 到达单次运行时长上限, 主动不开始(不是失败, 下次运行会重新检测)
+    SKIPPED = 4
 
     def is_success(self):
         return self == StudyResult.SUCCESS
 
     def is_failure(self):
-        return self != StudyResult.SUCCESS
+        # SKIPPED 属于「这次没做」而不是「做失败了」, 不能触发重试
+        return self not in (StudyResult.SUCCESS, StudyResult.SKIPPED)
+
+    def is_skipped(self):
+        return self == StudyResult.SKIPPED
 
 
 class SignType(IntEnum):
@@ -615,7 +622,12 @@ class Chaoxing:
         # 并发播放会让真实耗时变成总时长的 1/N, 效果等同倍速, 同样有漏任务点的风险。
         # last_iter 必须在拿到播放位之后再初始化, 否则排队等待的时间会被当成
         # "视频正在播放", 进度一次性跳一大截。
-        with playback_gate.hold(_job['name']):
+        with playback_gate.hold(_job['name'], should_stop=runtime_budget.should_stop) as acquired:
+            if not acquired:
+                # 排队期间到达运行时长上限: 这个视频本次不做, 下次运行会重新检测
+                logger.info("已达单次运行时长上限, 本次跳过该视频: {}", _job['name'])
+                return StudyResult.SKIPPED
+
             last_iter = time.time()
             play_started_at = last_iter
             start_play_time = play_time

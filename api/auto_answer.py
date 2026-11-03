@@ -32,6 +32,7 @@ from api.answer_engine import AnswerEngine, AnswerReport, build_submit_payload
 from api.base import Chaoxing, SessionManager
 from api.decode import decode_questions_info
 from api.logger import logger
+from api.runtime_budget import runtime_budget
 
 __all__ = ["AnswerTask", "AnswerStats", "AutoAnswer", "normalize_answer_config"]
 
@@ -308,6 +309,12 @@ class AutoAnswer:
 
         for index, task in enumerate(pending, start=1):
             label = "作业" if task.kind == "work" else "考试"
+            # 时间盒: 到点后不再开始新的作业/考试, 正在做的那份会做完
+            if runtime_budget.should_stop():
+                remaining = len(pending) - index + 1
+                stats.skipped += remaining
+                logger.warning(f"[自动答题] 到达运行时长上限, 剩余 {remaining} 份不再处理")
+                break
             logger.info(f"[自动答题] ({index}/{len(pending)}) {label}: {task.title}")
             try:
                 report = self._answer_task(task)

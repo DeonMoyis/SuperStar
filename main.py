@@ -8,7 +8,7 @@ import time
 import traceback
 from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from queue import PriorityQueue
+from queue import Empty, PriorityQueue
 from threading import RLock
 from typing import Any
 
@@ -29,12 +29,14 @@ from api.notification import Notification
 from api.live import Live
 from api.live_process import LiveProcessor
 from api.playback import FORCED_SPEED, normalize_speed, playback_gate
+from api.runtime_budget import runtime_budget
 
 class ChapterResult(enum.Enum):
     SUCCESS=0,
     ERROR=1,
     NOT_OPEN=2,
     PENDING=3
+    SKIPPED=4,   # 到达单次运行时长上限, 本次不处理
 
 
 def log_error(func):
@@ -79,6 +81,10 @@ def parse_args():
     parser.add_argument(
         "-j", "--jobs", type=int, default=1,
         help="同时处理的章节数 (默认1=顺序处理; 视频播放已全局串行, 调大只对文档/测验类任务点有加速作用)"
+    )
+    parser.add_argument(
+        "--max-runtime", type=float, default=None, metavar="MINUTES",
+        help="单次运行时长上限(分钟)。到点后不再开始新任务, 正在执行的任务跑完后退出; 不填或 0 表示不限制"
     )
 
     parser.add_argument(
@@ -157,6 +163,12 @@ def load_config_from_file(config_path):
             common_config["speed"] = float(common_config["speed"])
         if "jobs" in common_config:
             common_config["jobs"] = int(common_config["jobs"])
+        # 单次运行时长上限(分钟), 0/留空表示不限制
+        if "max_runtime_minutes" in common_config:
+            try:
+                common_config["max_runtime_minutes"] = float(common_config["max_runtime_minutes"] or 0)
+            except (TypeError, ValueError):
+                common_config["max_runtime_minutes"] = 0
         # 处理notopen_action，设置默认值为retry
         if "notopen_action" not in common_config:
             common_config["notopen_action"] = "retry"
@@ -219,6 +231,7 @@ def build_config_from_args(args):
         "course_list": [item.strip() for item in args.list.split(",") if item.strip()] if args.list else None,
         "speed": FORCED_SPEED,
         "jobs": args.jobs if args.jobs else 1,
+        "max_runtime_minutes": getattr(args, "max_runtime", None),
         "notopen_action": args.notopen_action if args.notopen_action else "retry",
         "verbose": args.verbose,
         "answer_only": getattr(args, "answer_only", False),
@@ -236,6 +249,9 @@ def init_config():
         common_config, tiku_config, notification_config = load_config_from_file(args.config)
         if args.verbose:
             common_config["verbose"] = True
+        # 命令行给的运行时长上限优先级最高
+        if getattr(args, "max_runtime", None) is not None:
+            common_config["max_runtime_minutes"] = args.max_runtime
         # 命令行开关优先级高于配置文件
         answer_raw = dict(common_config.get("answer", {}))
         if getattr(args, "auto_answer", False) or getattr(args, "answer_only", False):
@@ -392,6 +408,10 @@ class JobProcessor:
         self.max_tries = 5
         self.tasks = tasks
         self.failed_tasks: list[ChapterTask] = []
+        # 因为到达单次运行时长上限而没开始的任务
+        self.skipped_tasks: list[ChapterTask] = []
+        self.budget_stop = threading.Event()
+        self.budget_monitor: threading.Thread | None = None
         self.task_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.retry_queue: PriorityQueue[ChapterTask] = PriorityQueue()
         self.wait_queue: PriorityQueue[ChapterTask] = PriorityQueue()
@@ -419,8 +439,15 @@ class JobProcessor:
         self.retry_worker = threading.Thread(target=self.retry_thread, daemon=True)
         self.retry_worker.start()
 
+        # 时间盒: 到点后把还没开始的任务摘掉, 让下面的 join() 能返回。
+        # 已在执行的任务不受影响, 会正常跑完。
+        if runtime_budget.enabled:
+            self.budget_monitor = threading.Thread(target=self._budget_monitor, daemon=True)
+            self.budget_monitor.start()
+
         self.task_queue.join()
 
+        self.budget_stop.set()
         self.retry_queue.put(self._stop_task())
         for _ in self.threads:
             self.task_queue.put(self._stop_task())
@@ -429,6 +456,39 @@ class JobProcessor:
             thread.join()
         if self.retry_worker:
             self.retry_worker.join()
+
+    def _budget_monitor(self):
+        """盯着运行时长, 到点就把队列里还没开始的任务全部摘掉"""
+        while not self.budget_stop.is_set():
+            if runtime_budget.should_stop():
+                self._abort_pending()
+                return
+            self.budget_stop.wait(2)
+
+    def _abort_pending(self):
+        """把队列里尚未开始的任务标记为跳过
+
+        这些任务还没被 worker 取走, 所以直接 task_done 让 join() 可以返回;
+        正在执行的任务不在队列里, 会照常跑完。
+        """
+        skipped = 0
+        while True:
+            try:
+                task = self.task_queue.get_nowait()
+            except Empty:
+                break
+            if self._is_stop_task(task):
+                self.task_queue.task_done()
+                continue
+            task.result = ChapterResult.SKIPPED
+            self.skipped_tasks.append(task)
+            self.task_queue.task_done()
+            skipped += 1
+
+        if skipped:
+            logger.warning(
+                f"[时长上限] 本课程还有 {skipped} 个章节没开始, 已跳过, 下次运行会继续处理"
+            )
 
 
     @log_error
@@ -441,6 +501,13 @@ class JobProcessor:
                 logger.debug("Queue worker stopped")
                 return
 
+            # 已经到点: 这个任务还没开始, 直接跳过, 不要浪费时间
+            if runtime_budget.should_stop():
+                task.result = ChapterResult.SKIPPED
+                self.skipped_tasks.append(task)
+                self.task_queue.task_done()
+                continue
+
             task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
 
             match task.result:
@@ -448,6 +515,13 @@ class JobProcessor:
                     logger.debug("Task success: {}", task.point["title"])
                     self.task_queue.task_done()
                     logger.debug(f"unfinished task: {self.task_queue.unfinished_tasks}")
+
+                case ChapterResult.SKIPPED:
+                    logger.info("到达运行时长上限, 跳过章节: {}", task.point["title"])
+                    if task not in self.skipped_tasks:
+                        self.skipped_tasks.append(task)
+                    self.task_queue.task_done()
+                    continue
 
                 case ChapterResult.NOT_OPEN:
                     if self.config["notopen_action"] == "continue":
@@ -490,6 +564,12 @@ class JobProcessor:
             if self._is_stop_task(task):
                 self.retry_queue.task_done()
                 return
+            # 到点后不再安排重试, 否则 join() 会一直等下去
+            if runtime_budget.should_stop():
+                task.result = ChapterResult.SKIPPED
+                self.skipped_tasks.append(task)
+                self.retry_queue.task_done()
+                continue
             self.task_queue.put(task)
             # task_done is not called when a task failed and needs to be retried so if is reinserted into the queue,
             # the task num will increase by one and become more than the real task number
@@ -500,6 +580,10 @@ class JobProcessor:
 
 def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, Any], speed:float) -> ChapterResult:
     """处理单个章节"""
+    # 到点就不要再发起新请求了
+    if runtime_budget.should_stop():
+        return ChapterResult.SKIPPED
+
     logger.info(f'当前章节: {point["title"]}')
     if point["has_finished"]:
         logger.info(f'章节：{point["title"]} 已完成所有任务点')
@@ -530,6 +614,10 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
         if result.is_failure():
             return ChapterResult.ERROR
 
+    # 有任务点因为到点被跳过, 章节就不算"完成", 交给上层决定
+    if any(result.is_skipped() for result in job_results):
+        return ChapterResult.SKIPPED
+
     return ChapterResult.SUCCESS
 
 
@@ -557,6 +645,10 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     p = JobProcessor(chaoxing, course, tasks, config)
     p.run()
 
+    if p.skipped_tasks:
+        logger.warning(
+            f"课程 {course['title']} 有 {len(p.skipped_tasks)} 个章节因到达时长上限未处理, 下次运行会接着做"
+        )
     logger.info(f"课程 {course['title']} 处理结束 | {playback_gate.stats()}")
 
     tqdm.format_sizeof = _old_format_sizeof
@@ -626,6 +718,9 @@ def main():
             f"播放节奏: {FORCED_SPEED:g} 倍速, 视频串行播放, 章节并发数 {common_config['jobs']}"
         )
 
+        # 时间盒: 到点后不再开新任务, 正在执行的任务跑完后退出
+        runtime_budget.configure(common_config.get("max_runtime_minutes"))
+
         # 初始化 DeepSeek(没填 api_key 会自动关闭, 不影响其余功能)
         ai_config = normalize_ai_config(common_config.get("ai"))
         ai_solver = configure_default_solver(common_config.get("ai"))
@@ -674,6 +769,9 @@ def main():
         else:
             logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")
             for course in course_task:
+                if runtime_budget.should_stop():
+                    logger.warning("已达到单次运行时长上限, 不再开始新的课程")
+                    break
                 process_course(chaoxing, course, common_config)
             logger.info("所有课程学习任务已完成")
 
@@ -684,6 +782,9 @@ def main():
             auto_answer = AutoAnswer(chaoxing, answer_config, ai_solver=ai_solver)
             stats_list = []
             for course in course_task:
+                if runtime_budget.should_stop():
+                    logger.warning("[自动答题] 已达到单次运行时长上限, 不再处理剩余课程")
+                    break
                 try:
                     stats_list.append(auto_answer.run_course(course))
                 except Exception as exc:
@@ -699,9 +800,14 @@ def main():
         else:
             logger.info("未启用自动答题, 如需作答作业/考试请加 --auto-answer 或配置 [answer] enable=true")
 
-        done_msg = "chaoxing : 所有课程学习任务已完成"
+        if runtime_budget.expired:
+            done_msg = "chaoxing : 已达到单次运行时长上限, 本次收尾退出(下次运行会从断点继续)"
+        else:
+            done_msg = "chaoxing : 所有课程学习任务已完成"
         if answer_summary:
             done_msg += "\n" + answer_summary
+        done_msg += "\n" + runtime_budget.summary()
+        logger.info(runtime_budget.summary())
         logger.info(done_msg)
         notification.send(done_msg)
 

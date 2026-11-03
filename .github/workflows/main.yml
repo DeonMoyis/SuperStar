@@ -4,13 +4,28 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:   # 支持在 Actions 页面手动触发
-  #是否开始每天8点定时刷课，若要开启请把下面两行注释去掉
-  #schedule:
-  #  - cron: "0 8 * * *" 
-    
+    inputs:
+      max_runtime:
+        description: "本次运行时长上限(分钟)。留空则用仓库变量 MAX_RUNTIME_MINUTES, 都没设就是 110"
+        required: false
+        default: ""
+
+  # ===== 分段刷课: 取消下面两行注释即可启用 =====
+  # 每次跑 MAX_RUNTIME_MINUTES 分钟就退出, 隔一段时间由 Actions 再触发下一次,
+  # 相当于"每天学几段", 比一次跑完全部更接近真人节奏。
+  # 下面表示每 4 小时跑一次(0/4/8/12/16/20 点), 一天 6 次。
+  #
+  # 注意 Actions 免费额度: 私有仓库每月 2000 分钟。
+  #   每次 110 分钟 x 每天 6 次 = 660 分钟/天, 一个月远超免费额度。
+  #   想长期跑建议把时长调到 30~60 分钟, 或把频率降到每天 1~2 次。
+  # schedule:
+  #   - cron: "0 0,4,8,12,16,20 * * *"
+
 jobs: 
   Start:
     runs-on: ubuntu-latest # 在最新版本的 Ubuntu 操作系统环境下运行
+    # 兜底: 即使程序自身没退出, 也不让这个 job 一直挂着(Actions 单 job 上限 6 小时)
+    timeout-minutes: 350
     steps: # 要执行的步骤
       - name: 拷贝代码
         uses: actions/checkout@v4  # 用于将github代码仓库的代码拷贝到工作目录中
@@ -35,6 +50,9 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           # 可选: 在 Variables 里设置 ANSWER_SUBMIT = auto / always / never
           ANSWER_SUBMIT: ${{ vars.ANSWER_SUBMIT }}
+          # 单次运行时长上限(分钟):
+          #   手动触发时填的值 > 仓库 Variables 里的 MAX_RUNTIME_MINUTES > 默认 110
+          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime || vars.MAX_RUNTIME_MINUTES || '110' }}
         run: |
           args=(-u "$CHAOXING_USERNAME" -p "$CHAOXING_PASSWORD")
           if [ -n "$CHAOXING_COURSE_LIST" ]; then
@@ -46,4 +64,7 @@ jobs:
               args+=(--answer-submit "$ANSWER_SUBMIT")
             fi
           fi
+          # 到点后程序自己收尾退出, 正在播的视频会播完
+          args+=(--max-runtime "$MAX_RUNTIME_MINUTES")
+          echo "本次运行时长上限: ${MAX_RUNTIME_MINUTES} 分钟"
           python main.py "${args[@]}"
