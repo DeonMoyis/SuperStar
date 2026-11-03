@@ -27,6 +27,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+from api.ai_solver import get_default_solver
 from api.answer_engine import AnswerEngine, AnswerReport, build_submit_payload
 from api.base import Chaoxing, SessionManager
 from api.decode import decode_questions_info
@@ -258,12 +259,22 @@ def decode_task_list(html_text: str, kind: str, base_url: str = "https://mooc1.c
 class AutoAnswer:
     """作业 / 考试 自动答题器"""
 
-    def __init__(self, chaoxing: Chaoxing, config: Optional[dict[str, Any]] = None):
+    def __init__(self, chaoxing: Chaoxing, config: Optional[dict[str, Any]] = None, ai_solver=None):
         self.chaoxing = chaoxing
         self.config = normalize_answer_config(config)
         self._dumped: set[str] = set()
         query_delay = self.chaoxing.kwargs.get("query_delay", 0)
-        self.engine = AnswerEngine(self.chaoxing.tiku, query_delay=query_delay)
+
+        # AI 求解器: 优先用调用方传进来的, 否则取全局实例([ai] 配置初始化过的那个)
+        solver = ai_solver if ai_solver is not None else get_default_solver()
+        ai_mode = getattr(getattr(solver, "config", None), "mode", "off")
+        self.ai_solver = solver if ai_mode != "off" else None
+        self.engine = AnswerEngine(
+            self.chaoxing.tiku,
+            query_delay=query_delay,
+            ai_solver=self.ai_solver,
+            ai_mode=ai_mode,
+        )
 
     # ------------------------------------------------------------ 对外入口
     def run_courses(self, courses: list[dict[str, Any]]) -> list[AnswerStats]:

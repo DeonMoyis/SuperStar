@@ -52,11 +52,15 @@ class SolvedQuestion:
     """单题的作答结果"""
     question: dict[str, Any]
     answer: str
-    source: str  # tiku(题库命中) / random(随机兜底) / empty(无法作答)
+    source: str  # tiku(题库命中) / ai(大模型作答) / random(随机兜底) / empty(无法作答)
 
     @property
     def is_covered(self) -> bool:
         return self.source == "tiku"
+
+    @property
+    def is_ai(self) -> bool:
+        return self.source == "ai"
 
 
 @dataclass
@@ -75,29 +79,45 @@ class AnswerReport:
 
     @property
     def covered(self) -> int:
+        """题库命中数"""
         return sum(1 for item in self.solved if item.is_covered)
 
     @property
+    def ai_count(self) -> int:
+        """大模型作答数"""
+        return sum(1 for item in self.solved if item.is_ai)
+
+    @property
     def cover_rate(self) -> float:
-        """题库覆盖率, 0.0 ~ 1.0"""
+        """有依据的作答比例(题库 + 大模型), 0.0 ~ 1.0"""
         if not self.total:
             return 0.0
-        return self.covered / self.total
+        return (self.covered + self.ai_count) / self.total
 
     def summary(self) -> str:
         return (
             f"{self.title or '本次作答'}: 共 {self.total} 题, "
-            f"题库命中 {self.covered} 题, 覆盖率 {self.cover_rate * 100:.0f}%, "
-            f"耗时 {self.elapsed:.1f}s"
+            f"题库命中 {self.covered} 题, AI 作答 {self.ai_count} 题, "
+            f"覆盖率 {self.cover_rate * 100:.0f}%, 耗时 {self.elapsed:.1f}s"
         )
 
 
 class AnswerEngine:
-    """题目 -> 答案 的通用引擎"""
+    """题目 -> 答案 的通用引擎
 
-    def __init__(self, tiku, query_delay: float = 0.0):
+    ai_mode:
+        - "fallback": 先题库, 题库没命中再问大模型 (默认, 最省钱)
+        - "priority": 先问大模型, 失败再回落到题库
+        - "off"     : 不用大模型
+    """
+
+    def __init__(self, tiku, query_delay: float = 0.0, ai_solver=None, ai_mode: str = "fallback"):
         self.tiku = tiku
         self.query_delay = max(0.0, float(query_delay or 0))
+        self.ai_solver = ai_solver if getattr(ai_solver, "available", False) else None
+        self.ai_mode = ai_mode if self.ai_solver else "off"
+        if ai_solver is not None and self.ai_solver is None:
+            logger.warning("[AI] 已提供大模型配置但未生效(缺少 api_key 或 mode=off)")
 
     # ------------------------------------------------------------------ 对外接口
     def solve_all(self, questions: list[dict[str, Any]], title: str = "") -> AnswerReport:
@@ -105,37 +125,40 @@ class AnswerEngine:
         started = time.time()
         report = AnswerReport(title=title)
 
+        # AI 优先模式: 先把所有题目丢给大模型并发作答, 再逐题回填, 避免串行等待
+        ai_answers: dict[str, Any] = {}
+        if self.ai_mode == "priority" and questions:
+            ai_answers = self.ai_solver.solve_many(questions)
+
         for question in questions:
-            solved = self.solve_one(question)
+            solved = self.solve_one(question, ai_prefetched=ai_answers.get(question.get("id", "")))
             report.solved.append(solved)
 
         report.elapsed = time.time() - started
         logger.info(report.summary())
         return report
 
-    def solve_one(self, question: dict[str, Any]) -> SolvedQuestion:
+    def solve_one(self, question: dict[str, Any], ai_prefetched=None) -> SolvedQuestion:
         """作答题, 返回的答案同时写入 question['answerField']"""
         q_type = question.get("type", "unknown")
         options = question.get("options", "") or ""
         question_id = question.get("id", "")
 
-        resolved = ""
-        if not self._tiku_disabled():
-            try:
-                resolved = self.tiku.query(question) or ""
-            except Exception as exc:  # 题库挂了不能拖垮整份作业
-                logger.warning(f"题库查询异常, 本题改用随机答案: {exc}")
-                resolved = ""
-
         answer = ""
-        source = "random"
-        if resolved:
-            answer = self._match_answer(q_type, resolved, options)
-            if answer:
-                source = "tiku"
-                logger.info(f"成功获取到答案: {answer}")
-            else:
-                logger.warning(f"题库有返回但没能对上选项 -> {resolved!r}, 改为随机答案")
+        source = ""
+
+        if self.ai_mode == "priority":
+            answer, source = self._solve_by_ai(question, ai_prefetched)
+            if not answer:
+                answer, source = self._solve_by_tiku(question, q_type, options)
+
+        elif self.ai_mode == "fallback":
+            answer, source = self._solve_by_tiku(question, q_type, options)
+            if not answer:
+                answer, source = self._solve_by_ai(question, ai_prefetched)
+
+        else:
+            answer, source = self._solve_by_tiku(question, q_type, options)
 
         if not answer:
             answer = self._random_answer(q_type, options)
@@ -149,8 +172,67 @@ class AnswerEngine:
         answer_field = question.setdefault("answerField", {})
         answer_field[f"answer{question_id}"] = answer
         question[f"answer_source{question_id}"] = source
-        logger.info(f'{question.get("title", "")} 填写答案为 {answer or "<空>"}')
+        logger.info(f'{question.get("title", "")} 填写答案为 {answer or "<空>"} (来源: {source})')
         return SolvedQuestion(question=question, answer=answer, source=source)
+
+    # ------------------------------------------------------------------ 两种答案来源
+    def _solve_by_tiku(self, question: dict[str, Any], q_type: str, options: str) -> tuple[str, str]:
+        if self._tiku_disabled():
+            return "", ""
+        try:
+            resolved = self.tiku.query(question) or ""
+        except Exception as exc:  # 题库挂了不能拖垮整份作业
+            logger.warning(f"题库查询异常, 本题改用大模型/随机答案: {exc}")
+            return "", ""
+        if not resolved:
+            return "", ""
+
+        answer = self._match_answer(q_type, resolved, options)
+        if not answer:
+            logger.warning(f"题库有返回但没能对上选项 -> {resolved!r}")
+            return "", ""
+        logger.info(f"题库命中: {answer}")
+        return answer, "tiku"
+
+    def _solve_by_ai(self, question: dict[str, Any], prefetched=None) -> tuple[str, str]:
+        if not self.ai_solver:
+            return "", ""
+        try:
+            ai_answer = prefetched if prefetched is not None else self.ai_solver.solve(question)
+        except Exception as exc:
+            logger.error(f"[AI] 本题作答异常: {type(exc).__name__}: {exc}")
+            return "", ""
+        if not ai_answer:
+            return "", ""
+
+        text = self._format_ai_answer(question.get("type", "unknown"), ai_answer.answer)
+        if not text:
+            logger.warning("[AI] 答案为空, 放弃使用")
+            return "", ""
+        logger.info(
+            f"[AI] 作答: {text} (置信度 {ai_answer.confidence:.2f}"
+            f"{', 缓存' if ai_answer.from_cache else ''}{', 纠错过' if ai_answer.repaired else ''}"
+            f"{', 依据: ' + ai_answer.reason if ai_answer.reason else ''})"
+        )
+        return text, "ai"
+
+    @staticmethod
+    def _format_ai_answer(q_type: str, values) -> str:
+        """把 AI 给的结构化答案转成超星提交格式"""
+        items = [str(item).strip() for item in (values or []) if str(item).strip()]
+        if not items:
+            return ""
+        if q_type in {"single", "multiple"}:
+            return "".join(sorted({item.upper()[:1] for item in items}))
+        if q_type == "judgement":
+            first = items[0]
+            if first in {"正确", "对", "√", "是", "true", "True"}:
+                return "true"
+            if first in {"错误", "错", "×", "否", "false", "False"}:
+                return "false"
+            return ""
+        # 填空题多个空用换行分隔, 简答题直接给文本
+        return "\n".join(items)
 
     # ------------------------------------------------------------------ 答案匹配
     def _match_answer(self, q_type: str, resolved: str, options: str) -> str:
@@ -160,7 +242,12 @@ class AnswerEngine:
         if q_type == "single":
             return self._match_single(resolved, options)
         if q_type == "judgement":
-            return "true" if self.tiku.judgement_select(resolved) else "false"
+            verdict = None
+            if self.tiku is not None and hasattr(self.tiku, "judgement_select"):
+                verdict = self.tiku.judgement_select(resolved)
+            if verdict is None:
+                verdict = str(resolved).strip() in {"正确", "对", "√", "是", "true", "True"}
+            return "true" if verdict else "false"
         if q_type == "completion":
             if isinstance(resolved, list):
                 return "".join(str(item) for item in resolved)
@@ -340,8 +427,8 @@ def build_submit_payload(questions: dict[str, Any], report: AnswerReport) -> dic
         question_id = question["id"]
         answer_field = question.get("answerField", {})
         answer_value = answer_field.get(f"answer{question_id}", "")
-        if not submit_mode and item.source != "tiku":
-            # 保存模式: 只保留确定命中的答案
+        if not submit_mode and item.source not in {"tiku", "ai"}:
+            # 保存模式: 题库命中和 AI 作答都保留, 纯随机答案不写进草稿
             answer_value = ""
         payload[f"answer{question_id}"] = answer_value
         payload[f"answertype{question_id}"] = answer_field.get(f"answertype{question_id}", "")

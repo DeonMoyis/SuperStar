@@ -1288,6 +1288,51 @@ class SiliconFlow(Tiku):
             return False
 
 
+class DeepSeek(Tiku):
+    """DeepSeek 大模型答题 (复用 api.ai_solver 的实现)
+
+    配置统一放在配置文件的 [ai] 节, 与「作业/考试自动答题」共用同一个
+    API Key、答案缓存和限流器, 不会重复建连接、重复烧钱。
+
+    用法: [tiku] provider=TikuGo,DeepSeek
+          -> 先用题库, 题库没命中再让 DeepSeek 兜底
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.name = 'DeepSeek'
+        self.solver = None
+
+    def _init_tiku(self):
+        from api.ai_solver import get_default_solver
+
+        self.solver = get_default_solver()
+        if self.solver is None or not self.solver.available:
+            logger.warning("DeepSeek 未启用: 请填写配置文件 [ai] 节的 api_key")
+            self.DISABLE = True
+
+    def _query(self, q_info: dict):
+        if not self.solver:
+            return None
+        answer = self.solver.solve(q_info)
+        if not answer or not answer.answer:
+            return None
+        if q_info.get('type') == 'judgement':
+            return answer.answer[0]
+        return answer.text
+
+    def check_llm_connection(self) -> bool:
+        if not self.solver:
+            logger.error('DeepSeek 未初始化, 请检查 [ai] 配置')
+            return False
+        ok, message = self.solver.check_connection()
+        if ok:
+            logger.info(f'{self.name} {message}')
+        else:
+            logger.error(f'{self.name} {message}')
+        return ok
+
+
 PROVIDER_REGISTRY = {
     'TikuYanxi': TikuYanxi,
     'TikuGo': TikuGo,
@@ -1295,4 +1340,5 @@ PROVIDER_REGISTRY = {
     'TikuAdapter': TikuAdapter,
     'AI': AI,
     'SiliconFlow': SiliconFlow,
+    'DeepSeek': DeepSeek,
 }

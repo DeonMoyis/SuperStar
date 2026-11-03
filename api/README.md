@@ -5,6 +5,7 @@
 - `answer.py`: 提供多种题库接口和答题功能
 - `answer_check.py`: 答案检查和验证
 - `answer_engine.py`: 通用答题引擎，把「题目 -> 答案」的匹配与降级逻辑抽出复用
+- `ai_solver.py`: DeepSeek AI 搜题答题（提示词、JSON 输出、答案纠错、重试、缓存、并发）
 - `auto_answer.py`: 作业 / 考试自动答题（扫列表、抓题、作答、按覆盖率提交）
 - `cipher.py`: AES加密解密功能
 - `config.py`: 全局配置常量

@@ -15,6 +15,12 @@ from typing import Any
 from tqdm import tqdm
 
 from api.answer import Tiku
+from api.ai_solver import (
+    configure_default_solver,
+    get_default_solver,
+    normalize_ai_config,
+    release_default_solver,
+)
 from api.auto_answer import AutoAnswer, normalize_answer_config
 from api.base import Chaoxing, Account, StudyResult
 from api.exceptions import LoginError, InputFormatError
@@ -106,6 +112,20 @@ def parse_args():
         help="把抓到的作业/考试原始页面存到 answer_debug/ 目录, 用于排查解析问题"
     )
 
+    # ---------------- DeepSeek AI 答题 ----------------
+    parser.add_argument(
+        "--deepseek-key", type=str, default=None,
+        help="DeepSeek API Key, 填了就会用 DeepSeek 搜题答题(也可写在配置文件 [ai] 节)"
+    )
+    parser.add_argument(
+        "--ai-model", type=str, default=None,
+        help="AI 模型名, 默认 deepseek-flash"
+    )
+    parser.add_argument(
+        "--ai-mode", type=str, default=None, choices=["fallback", "priority", "off"],
+        help="AI 使用方式: fallback-题库优先AI兜底(默认), priority-AI优先, off-关闭"
+    )
+
     # 在解析之前捕获 -h 的行为
     if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
         parser.print_help()
@@ -162,6 +182,10 @@ def load_config_from_file(config_path):
     if config.has_section("answer"):
         common_config["answer"] = dict(config.items("answer"))
 
+    # 检查并读取ai节(DeepSeek 搜题答题)
+    if config.has_section("ai"):
+        common_config["ai"] = dict(config.items("ai"))
+
     return common_config, tiku_config, notification_config
 
 
@@ -176,6 +200,15 @@ def build_config_from_args(args):
     if getattr(args, "answer_debug", False):
         answer_config["debug"] = "true"
 
+    # DeepSeek AI 配置
+    ai_config: dict[str, Any] = {}
+    if getattr(args, "deepseek_key", None):
+        ai_config["api_key"] = args.deepseek_key
+    if getattr(args, "ai_model", None):
+        ai_config["model"] = args.ai_model
+    if getattr(args, "ai_mode", None):
+        ai_config["mode"] = args.ai_mode
+
     common_config = {
         "use_cookies": args.use_cookies,
         "username": args.username,
@@ -187,6 +220,7 @@ def build_config_from_args(args):
         "verbose": args.verbose,
         "answer_only": getattr(args, "answer_only", False),
         "answer": answer_config,
+        "ai": ai_config,
     }
     return common_config, {}, {}
 
@@ -209,6 +243,16 @@ def init_config():
             answer_raw["debug"] = "true"
         common_config["answer"] = answer_raw
         common_config["answer_only"] = getattr(args, "answer_only", False)
+
+        # 命令行给的 DeepSeek 参数优先级最高
+        ai_raw = dict(common_config.get("ai", {}))
+        if getattr(args, "deepseek_key", None):
+            ai_raw["api_key"] = args.deepseek_key
+        if getattr(args, "ai_model", None):
+            ai_raw["model"] = args.ai_model
+        if getattr(args, "ai_mode", None):
+            ai_raw["mode"] = args.ai_mode
+        common_config["ai"] = ai_raw
         return common_config, tiku_config, notification_config
     else:
         return build_config_from_args(args)
@@ -240,7 +284,7 @@ def init_chaoxing(common_config, tiku_config):
     # 根据配置文件中的 provider 判断是否为大模型题库
     provider = tiku_config.get('provider', '')
     provider_list = [name.strip() for name in provider.split(',') if name.strip()]
-    if any(name in ['AI', 'SiliconFlow'] for name in provider_list):
+    if any(name in ['AI', 'SiliconFlow', 'DeepSeek'] for name in provider_list):
         check_connection = tiku_config.get('check_llm_connection', 'true').lower() == 'true'
         if check_connection:
             logger.info(f'正在验证大模型配置 (provider={provider})...')
@@ -567,6 +611,22 @@ def main():
         # 强制播放按照配置文件调节
         common_config["speed"] = min(2.0, max(1.0, common_config.get("speed", 1.0)))
         common_config["notopen_action"] = common_config.get("notopen_action", "retry")
+
+        # 初始化 DeepSeek(没填 api_key 会自动关闭, 不影响其余功能)
+        ai_config = normalize_ai_config(common_config.get("ai"))
+        ai_solver = configure_default_solver(common_config.get("ai"))
+        if ai_config.enabled:
+            if ai_config.check_connection:
+                ok, message = ai_solver.check_connection()
+                if ok:
+                    logger.info(f"[AI] {message}")
+                else:
+                    logger.error(f"[AI] 连接检查失败: {message}")
+                    logger.error("[AI] 本次不使用 AI 作答, 题目将由题库/随机答案兜底")
+                    ai_config.mode = "off"
+                    ai_solver.config.mode = "off"
+        else:
+            logger.info("[AI] 未配置 DeepSeek API Key, AI 搜题答题未启用")
         
         # 初始化超星实例
         chaoxing = init_chaoxing(common_config, tiku_config)
@@ -607,7 +667,7 @@ def main():
         answer_summary = ""
         if answer_config["enable"]:
             logger.info("开始作业/考试自动答题...")
-            auto_answer = AutoAnswer(chaoxing, answer_config)
+            auto_answer = AutoAnswer(chaoxing, answer_config, ai_solver=ai_solver)
             stats_list = []
             for course in course_task:
                 try:
@@ -618,6 +678,10 @@ def main():
             if stats_list:
                 answer_summary = "\n".join(stats.summary() for stats in stats_list)
                 logger.info("自动答题汇总:\n" + answer_summary)
+            # AI 用量统计, 方便估算花了多少钱
+            solver = get_default_solver()
+            if solver and solver.available and solver.requests:
+                logger.info(f"[AI] 本次用量: {solver.stats()}")
         else:
             logger.info("未启用自动答题, 如需作答作业/考试请加 --auto-answer 或配置 [answer] enable=true")
 
@@ -626,7 +690,7 @@ def main():
             done_msg += "\n" + answer_summary
         logger.info(done_msg)
         notification.send(done_msg)
-        
+
     except SystemExit as e:
         if e.code != 0:
             logger.error(f"错误: 程序异常退出, 返回码: {e.code}")
@@ -641,6 +705,9 @@ def main():
         except Exception:
             pass  # 如果通知发送失败，忽略异常
         raise e
+    finally:
+        # 把 AI 答案缓存落盘, 下次同样的题目直接命中, 不用再花钱
+        release_default_solver()
 
 
 if __name__ == "__main__":

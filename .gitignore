@@ -157,3 +157,7 @@ cache.json
 
 # 自动答题调试页面（--answer-debug 生成，不要提交）
 answer_debug/
+
+# AI 答题答案缓存（本地生成，不要提交）
+ai_cache.json
+ai_cache_test.json

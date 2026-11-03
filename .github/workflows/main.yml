@@ -3,6 +3,7 @@ name: 刷课
 on: 
   push:
     branches: [ main ]
+  workflow_dispatch:   # 支持在 Actions 页面手动触发
   #是否开始每天8点定时刷课，若要开启请把下面两行注释去掉
   #schedule:
   #  - cron: "0 8 * * *" 
@@ -29,4 +30,20 @@ jobs:
           CHAOXING_USERNAME: ${{ secrets.CHAOXING_USERNAME }}
           CHAOXING_PASSWORD: ${{ secrets.CHAOXING_PASSWORD }}
           CHAOXING_COURSE_LIST: ${{ secrets.CHAOXING_COURSE_LIST }}
-        run: python main.py -u "$CHAOXING_USERNAME" -p "$CHAOXING_PASSWORD" -l "$CHAOXING_COURSE_LIST"
+          # 在仓库 Settings -> Secrets and variables -> Actions 里添加 DEEPSEEK_API_KEY
+          # 就会自动开启「AI 搜题答题 + 作业/考试自动作答」
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # 可选: 在 Variables 里设置 ANSWER_SUBMIT = auto / always / never
+          ANSWER_SUBMIT: ${{ vars.ANSWER_SUBMIT }}
+        run: |
+          args=(-u "$CHAOXING_USERNAME" -p "$CHAOXING_PASSWORD")
+          if [ -n "$CHAOXING_COURSE_LIST" ]; then
+            args+=(-l "$CHAOXING_COURSE_LIST")
+          fi
+          if [ -n "$DEEPSEEK_API_KEY" ]; then
+            args+=(--auto-answer --deepseek-key "$DEEPSEEK_API_KEY")
+            if [ -n "$ANSWER_SUBMIT" ]; then
+              args+=(--answer-submit "$ANSWER_SUBMIT")
+            fi
+          fi
+          python main.py "${args[@]}"
