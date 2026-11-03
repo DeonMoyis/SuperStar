@@ -154,3 +154,6 @@ config*.ini
 .idea/
 .vscode/
 cache.json
+
+# 自动答题调试页面（--answer-debug 生成，不要提交）
+answer_debug/

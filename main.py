@@ -15,6 +15,7 @@ from typing import Any
 from tqdm import tqdm
 
 from api.answer import Tiku
+from api.auto_answer import AutoAnswer, normalize_answer_config
 from api.base import Chaoxing, Account, StudyResult
 from api.exceptions import LoginError, InputFormatError
 from api.logger import configure_console_logger, logger
@@ -86,6 +87,25 @@ def parse_args():
 
     parser.add_argument("--auto-sign", action="store_true", help="自动签到")
 
+    # ---------------- 作业/考试 自动答题 ----------------
+    parser.add_argument(
+        "--auto-answer", action="store_true",
+        help="启用作业 + 考试自动答题(刷完课后自动作答)"
+    )
+    parser.add_argument(
+        "--answer-only", action="store_true",
+        help="只做作业/考试, 不刷视频任务点(会自动启用自动答题)"
+    )
+    parser.add_argument(
+        "--answer-submit", type=str, default=None,
+        choices=["auto", "always", "never"],
+        help="答题后如何提交: auto-覆盖率达标才提交, always-总是提交, never-只保存"
+    )
+    parser.add_argument(
+        "--answer-debug", action="store_true",
+        help="把抓到的作业/考试原始页面存到 answer_debug/ 目录, 用于排查解析问题"
+    )
+
     # 在解析之前捕获 -h 的行为
     if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
         parser.print_help()
@@ -137,12 +157,25 @@ def load_config_from_file(config_path):
     # 检查并读取notification节
     if config.has_section("notification"):
         notification_config = dict(config.items("notification"))
-    
+
+    # 检查并读取answer节(作业/考试自动答题)
+    if config.has_section("answer"):
+        common_config["answer"] = dict(config.items("answer"))
+
     return common_config, tiku_config, notification_config
 
 
 def build_config_from_args(args):
     """从命令行参数构建配置"""
+    # 作业/考试答题配置: 只有命令行显式给了才覆盖, 其余交给配置文件/默认值
+    answer_config: dict[str, Any] = {}
+    if getattr(args, "auto_answer", False) or getattr(args, "answer_only", False):
+        answer_config["enable"] = "true"
+    if getattr(args, "answer_submit", None):
+        answer_config["submit_policy"] = args.answer_submit
+    if getattr(args, "answer_debug", False):
+        answer_config["debug"] = "true"
+
     common_config = {
         "use_cookies": args.use_cookies,
         "username": args.username,
@@ -152,6 +185,8 @@ def build_config_from_args(args):
         "jobs": args.jobs,
         "notopen_action": args.notopen_action if args.notopen_action else "retry",
         "verbose": args.verbose,
+        "answer_only": getattr(args, "answer_only", False),
+        "answer": answer_config,
     }
     return common_config, {}, {}
 
@@ -164,6 +199,16 @@ def init_config():
         common_config, tiku_config, notification_config = load_config_from_file(args.config)
         if args.verbose:
             common_config["verbose"] = True
+        # 命令行开关优先级高于配置文件
+        answer_raw = dict(common_config.get("answer", {}))
+        if getattr(args, "auto_answer", False) or getattr(args, "answer_only", False):
+            answer_raw["enable"] = "true"
+        if getattr(args, "answer_submit", None):
+            answer_raw["submit_policy"] = args.answer_submit
+        if getattr(args, "answer_debug", False):
+            answer_raw["debug"] = "true"
+        common_config["answer"] = answer_raw
+        common_config["answer_only"] = getattr(args, "answer_only", False)
         return common_config, tiku_config, notification_config
     else:
         return build_config_from_args(args)
@@ -542,14 +587,45 @@ def main():
         
         # 过滤要学习的课程
         course_task = filter_courses(all_course, common_config.get("course_list"))
-        
+
+        # 作业/考试自动答题配置(题库没配好时也能跑, 只是覆盖率会低)
+        answer_config = normalize_answer_config(
+            common_config.get("answer"), tiku_config.get("cover_rate", 0.9)
+        )
+        answer_only = bool(common_config.get("answer_only", False))
+
         # 开始学习
-        logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")
-        for course in course_task:
-            process_course(chaoxing, course, common_config)
-        
-        logger.info("所有课程学习任务已完成")
-        notification.send("chaoxing : 所有课程学习任务已完成")
+        if answer_only:
+            logger.info("已启用 --answer-only, 本次跳过视频/文档等任务点, 只做作业和考试")
+        else:
+            logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")
+            for course in course_task:
+                process_course(chaoxing, course, common_config)
+            logger.info("所有课程学习任务已完成")
+
+        # 作业 + 考试自动答题
+        answer_summary = ""
+        if answer_config["enable"]:
+            logger.info("开始作业/考试自动答题...")
+            auto_answer = AutoAnswer(chaoxing, answer_config)
+            stats_list = []
+            for course in course_task:
+                try:
+                    stats_list.append(auto_answer.run_course(course))
+                except Exception as exc:
+                    logger.error(f"[自动答题] 课程 {course.get('title')} 处理异常: {type(exc).__name__}: {exc}")
+                    logger.error(traceback.format_exc())
+            if stats_list:
+                answer_summary = "\n".join(stats.summary() for stats in stats_list)
+                logger.info("自动答题汇总:\n" + answer_summary)
+        else:
+            logger.info("未启用自动答题, 如需作答作业/考试请加 --auto-answer 或配置 [answer] enable=true")
+
+        done_msg = "chaoxing : 所有课程学习任务已完成"
+        if answer_summary:
+            done_msg += "\n" + answer_summary
+        logger.info(done_msg)
+        notification.send(done_msg)
         
     except SystemExit as e:
         if e.code != 0:
