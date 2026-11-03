@@ -309,10 +309,39 @@ def test_exam_start_blocked_by_remaining_time():
         SessionManager.get_session = original
 
 
+def test_exam_switch():
+    """--no-exam / --exam 必须能覆盖配置文件里的 exam"""
+    import sys as _sys
+
+    from main import build_config_from_args, parse_args
+
+    def build(argv):
+        original = _sys.argv
+        _sys.argv = ["main.py"] + argv
+        try:
+            return build_config_from_args(parse_args())[0]["answer"]
+        finally:
+            _sys.argv = original
+
+    base = ["-u", "a", "-p", "b", "--auto-answer"]
+    assert "exam" not in build(base), "没显式指定时不该覆盖配置文件"
+
+    off = build(base + ["--no-exam"])
+    assert off["exam"] == "false", off
+    assert normalize_answer_config(off)["exam"] is False
+    assert normalize_answer_config(off)["work"] is True, "关考试不该影响作业"
+
+    on = build(base + ["--exam"])
+    assert on["exam"] == "true", on
+    assert normalize_answer_config(on)["exam"] is True
+    print("[ok] 考试开关: 默认不覆盖 / --no-exam / --exam")
+
+
 def main():
     test_decode_task_list()
     test_answer_engine()
     test_config()
+    test_exam_switch()
     test_exam_priority_order()
     test_exam_start_blocked_by_remaining_time()
     test_pipeline()

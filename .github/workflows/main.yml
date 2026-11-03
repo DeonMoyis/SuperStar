@@ -50,6 +50,14 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           # 可选: 在 Variables 里设置 ANSWER_SUBMIT = auto / always / never
           ANSWER_SUBMIT: ${{ vars.ANSWER_SUBMIT }}
+          # 可选: 是否做作业/考试。
+          #   留空 -> 填了 DEEPSEEK_API_KEY 就自动开, 没填就只刷课
+          #   true / false -> 强制开关
+          AUTO_ANSWER: ${{ vars.AUTO_ANSWER }}
+          # 可选: 是否让程序代考。
+          #   留空 / true -> 考试也自动做
+          #   false       -> 跳过考试, 只做作业(考试有次数限制, 想自己考就设 false)
+          ANSWER_EXAM: ${{ vars.ANSWER_EXAM }}
           # 单次运行时长上限(分钟):
           #   手动触发时填的值 > 仓库 Variables 里的 MAX_RUNTIME_MINUTES > 默认 110
           MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime || vars.MAX_RUNTIME_MINUTES || '110' }}
@@ -58,12 +66,31 @@ jobs:
           if [ -n "$CHAOXING_COURSE_LIST" ]; then
             args+=(-l "$CHAOXING_COURSE_LIST")
           fi
-          if [ -n "$DEEPSEEK_API_KEY" ]; then
-            args+=(--auto-answer --deepseek-key "$DEEPSEEK_API_KEY")
+
+          # 作业/考试开关: AUTO_ANSWER 显式给了就听它的, 否则「有 Key 就开」
+          auto_answer="false"
+          if [ -n "$DEEPSEEK_API_KEY" ]; then auto_answer="true"; fi
+          if [ -n "$AUTO_ANSWER" ]; then auto_answer="$AUTO_ANSWER"; fi
+
+          if [ "$auto_answer" = "true" ]; then
+            args+=(--auto-answer)
+            if [ -n "$DEEPSEEK_API_KEY" ]; then
+              args+=(--deepseek-key "$DEEPSEEK_API_KEY")
+            fi
             if [ -n "$ANSWER_SUBMIT" ]; then
               args+=(--answer-submit "$ANSWER_SUBMIT")
             fi
+            # 考试开关: 只有明确设成 false/0 才跳过考试
+            if [ "$ANSWER_EXAM" = "false" ] || [ "$ANSWER_EXAM" = "0" ]; then
+              args+=(--no-exam)
+              echo "本次不处理考试, 只做作业"
+            else
+              echo "本次同时处理作业和考试"
+            fi
+          else
+            echo "本次不处理作业/考试"
           fi
+
           # 到点后程序自己收尾退出, 正在播的视频会播完
           args+=(--max-runtime "$MAX_RUNTIME_MINUTES")
           echo "本次运行时长上限: ${MAX_RUNTIME_MINUTES} 分钟"

@@ -120,6 +120,12 @@ def parse_args():
         "--answer-debug", action="store_true",
         help="把抓到的作业/考试原始页面存到 answer_debug/ 目录, 用于排查解析问题"
     )
+    # 考试开关: 考试通常是「学完一定进度才解锁」的, 要不要考交给你决定。
+    # 不传时跟随配置文件 [answer] exam 的值。
+    parser.add_argument(
+        "--exam", dest="answer_exam", action=argparse.BooleanOptionalAction, default=None,
+        help="本次处理考试; 用 --no-exam 跳过考试只做作业(考试有次数限制, 想自己考就加 --no-exam)"
+    )
 
     # ---------------- DeepSeek AI 答题 ----------------
     parser.add_argument(
@@ -214,6 +220,9 @@ def build_config_from_args(args):
         answer_config["submit_policy"] = args.answer_submit
     if getattr(args, "answer_debug", False):
         answer_config["debug"] = "true"
+    # 考试开关: 只有命令行显式给了 --exam / --no-exam 才覆盖配置文件
+    if getattr(args, "answer_exam", None) is not None:
+        answer_config["exam"] = "true" if args.answer_exam else "false"
 
     # DeepSeek AI 配置
     ai_config: dict[str, Any] = {}
@@ -260,6 +269,9 @@ def init_config():
             answer_raw["submit_policy"] = args.answer_submit
         if getattr(args, "answer_debug", False):
             answer_raw["debug"] = "true"
+        # 考试开关: --no-exam 时即使配置文件写了 exam=true 也跳过考试
+        if getattr(args, "answer_exam", None) is not None:
+            answer_raw["exam"] = "true" if args.answer_exam else "false"
         common_config["answer"] = answer_raw
         common_config["answer_only"] = getattr(args, "answer_only", False)
 
@@ -762,6 +774,14 @@ def main():
             common_config.get("answer"), tiku_config.get("cover_rate", 0.9)
         )
         answer_only = bool(common_config.get("answer_only", False))
+        if answer_config["enable"]:
+            logger.info(
+                f"自动答题: 作业 {'处理' if answer_config['work'] else '跳过'} / "
+                f"考试 {'处理' if answer_config['exam'] else '跳过'} "
+                f"(考试可用 --no-exam 关闭, 或配置 [answer] exam=false)"
+            )
+        else:
+            logger.info("自动答题: 未启用 (需要 --auto-answer / --answer-only 或 [answer] enable=true)")
 
         # 开始学习
         if answer_only:
