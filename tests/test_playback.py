@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""播放节奏测试: 1 倍速固定 + 视频串行
+"""播放 / 作答节奏测试: 1 倍速固定 + 串行闸门
 
-不需要登录, 也不需要真实网络。核心验证两件事:
+不需要登录, 也不需要真实网络。核心验证三件事:
 1. 任何倍速配置都会被压到 1.0
 2. 两个视频同时处理时, 真实耗时是相加而不是重叠(否则等于变相倍速)
+3. 章节测验共用同一个作答位, 同一时刻只有一份在作答/提交
 """
 import sys
 import threading
@@ -14,7 +15,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import api.base as base  # noqa: E402
-from api.playback import FORCED_SPEED, PlaybackGate, normalize_speed  # noqa: E402
+from api.playback import AnswerGate, FORCED_SPEED, PlaybackGate, normalize_speed  # noqa: E402
 
 
 class NullBar:
@@ -209,6 +210,33 @@ def test_start_position_skips_watched_part():
     print(f"[ok] 断点续播: 视频 {duration}s 已看 4s, 本次耗时 {elapsed:.2f}s")
 
 
+def test_answer_gate_is_exclusive():
+    """测验也要排队: 同一时刻只能有一份在作答/提交"""
+    gate = AnswerGate()
+    overlap = []
+    active = {"count": 0}
+
+    def worker(name):
+        with gate.hold(name) as acquired:
+            assert acquired is True
+            active["count"] += 1
+            overlap.append(active["count"])
+            time.sleep(0.2)
+            active["count"] -= 1
+
+    threads = [threading.Thread(target=worker, args=(f"测验{i}",)) for i in range(3)]
+    started = time.time()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.time() - started
+
+    assert max(overlap) == 1, f"同一时刻只允许 1 份测验在作答, 实际 {max(overlap)}"
+    assert elapsed >= 0.55, f"3 个 0.2s 的测验串行应 >= 0.6s, 实际 {elapsed:.2f}s"
+    print(f"[ok] 作答闸门互斥: 3 份测验串行, 总耗时 {elapsed:.2f}s")
+
+
 def test_play_time_unit_is_normalized():
     """403 恢复时 playTime 可能是毫秒, 不能当成秒直接判定播完"""
     from api.base import normalize_play_time
@@ -227,6 +255,7 @@ def main():
     test_speed_is_forced_to_one()
     test_command_line_speed_ignored()
     test_gate_is_exclusive()
+    test_answer_gate_is_exclusive()
     test_play_time_unit_is_normalized()
     test_single_video_runs_at_real_time()
     test_two_videos_do_not_overlap()

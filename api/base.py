@@ -28,7 +28,7 @@ from api.decode import (
     decode_questions_info,
 )
 from api.exceptions import MaxRetryExceeded
-from api.playback import FORCED_SPEED, playback_gate, format_duration
+from api.playback import FORCED_SPEED, answer_gate, playback_gate, format_duration
 from api.runtime_budget import runtime_budget
 
 
@@ -738,6 +738,22 @@ class Chaoxing:
             return StudyResult.SUCCESS
 
     def study_work(self, _course, _job, _job_info) -> StudyResult:
+        """章节测验入口: 同一时刻只允许一个测验在作答/提交
+
+        章节内的任务点是由 5 个线程并发处理的, 一个章节里有多个测验时,
+        旧实现会同时抓题、同时发 AI 请求、同时 POST 提交, 容易触发风控。
+        这里和视频一样加一个全局作答位, 互相排队。
+        """
+        if self.tiku.DISABLE or not self.tiku:
+            return StudyResult.SUCCESS
+
+        name = _job.get("name") or "章节测验"
+        with answer_gate.hold(name, should_stop=runtime_budget.should_stop) as acquired:
+            if not acquired:
+                return StudyResult.SKIPPED
+            return self._study_work_locked(_course, _job, _job_info)
+
+    def _study_work_locked(self, _course, _job, _job_info) -> StudyResult:
         # FIXME: 这一块可以单独搞一个类出来了，方法里面又套方法，每一次调用都会创建新的方法，十分浪费
         if self.tiku.DISABLE or not self.tiku:
             return StudyResult.SUCCESS

@@ -194,8 +194,9 @@ def test_pipeline():
         assert stats.tasks_found == 4, stats.tasks_found          # 2 份作业 + 2 份考试
         assert stats.answered == 2, f"应只作答未完成的那 2 份, 实际 {stats.answered}"
         assert stats.submitted == 2, "覆盖率达标应全部提交"
-        work_url, data = fake_session.posted[0]
-        exam_url, _ = fake_session.posted[1]
+        # 默认 exam_priority=true, 考试排在作业前面
+        exam_url, _ = fake_session.posted[0]
+        work_url, data = fake_session.posted[1]
         assert work_url.endswith("/mooc-ans/work/addStudentWorkNew"), work_url
         assert exam_url.endswith("/mooc-ans/exam/test/addExamTranExamNew"), exam_url
         assert data["answer9001"] == "B" and data["answer9002"] == "BD"
@@ -230,13 +231,90 @@ def test_config():
     assert config["min_cover_rate"] == 0.8
     assert config["submit_policy"] == "auto", "非法策略应回退为 auto"
     assert normalize_answer_config(None)["enable"] is False
+    # 考试相关的两个新配置
+    assert normalize_answer_config(None)["exam_priority"] is True, "默认应考试优先"
+    assert normalize_answer_config(None)["exam_min_remaining"] == 15
+    custom = normalize_answer_config({"exam_priority": "false", "exam_min_remaining": "30"})
+    assert custom["exam_priority"] is False and custom["exam_min_remaining"] == 30
+    bad = normalize_answer_config({"exam_min_remaining": "abc"})
+    assert bad["exam_min_remaining"] == 15, "非法值应回退为默认 15 分钟"
     print("[ok] 配置归一化:", config)
+
+
+def test_exam_priority_order():
+    """考试必须排在作业前面, 否则时间盒到点时考试会被饿死"""
+    fake_session = FakeSession()
+    original = SessionManager.get_session
+    SessionManager.get_session = classmethod(lambda cls: fake_session)
+    try:
+        chaoxing = Chaoxing(account=None, tiku=FakeTiku())
+        course = {"courseId": "111", "clazzId": "222", "cpi": "555", "title": "排序课程"}
+
+        answer = AutoAnswer(chaoxing, {"enable": True, "submit_policy": "always"})
+        answer.run_course(course)
+        kinds = ["考试" if "exam" in url else "作业" for url, _ in fake_session.posted]
+        assert kinds == ["考试", "作业"], f"应考试在前, 实际 {kinds}"
+        print("[ok] 考试优先排序:", kinds)
+
+        # 关掉优先时应恢复列表顺序(作业在前)
+        fake_session.posted.clear()
+        normal = AutoAnswer(
+            chaoxing, {"enable": True, "submit_policy": "always", "exam_priority": "false"}
+        )
+        normal.run_course(course)
+        kinds = ["考试" if "exam" in url else "作业" for url, _ in fake_session.posted]
+        assert kinds == ["作业", "考试"], f"关闭优先后应作业在前, 实际 {kinds}"
+        print("[ok] 关闭考试优先:", kinds)
+    finally:
+        SessionManager.get_session = original
+
+
+def test_exam_start_blocked_by_remaining_time():
+    """剩余时间不足阈值时不开考, 作业照做"""
+    from api.runtime_budget import runtime_budget
+
+    fake_session = FakeSession()
+    original = SessionManager.get_session
+    SessionManager.get_session = classmethod(lambda cls: fake_session)
+    original_budget = runtime_budget._limit
+    try:
+        # 上限 5 分钟, 开考门槛 15 分钟 -> 剩余不够, 考试应被推迟
+        runtime_budget.configure(5)
+        chaoxing = Chaoxing(account=None, tiku=FakeTiku())
+        course = {"courseId": "111", "clazzId": "222", "cpi": "555", "title": "时间不足"}
+
+        answer = AutoAnswer(
+            chaoxing, {"enable": True, "submit_policy": "always", "exam_min_remaining": 15}
+        )
+        stats = answer.run_course(course)
+        kinds = ["考试" if "exam" in url else "作业" for url, _ in fake_session.posted]
+        assert kinds == ["作业"], f"考试应被推迟, 实际提交了 {kinds}"
+        assert stats.postponed == 1, stats.postponed
+        # skipped 只统计「已完成/已批阅」的 2 份, 推迟的考试不算跳过
+        assert stats.answered == 1 and stats.skipped == 2, (stats.answered, stats.skipped)
+        assert "推迟" in stats.summary(), stats.summary()
+        print("[ok] 剩余时间不足不开考:", stats.summary())
+
+        # 门槛设为 0 时应关闭检查, 照常开考
+        fake_session.posted.clear()
+        runtime_budget.configure(5)
+        eager = AutoAnswer(
+            chaoxing, {"enable": True, "submit_policy": "always", "exam_min_remaining": 0}
+        )
+        stats_eager = eager.run_course(course)
+        assert stats_eager.postponed == 0 and stats_eager.answered == 2
+        print("[ok] 关闭检查后正常开考:", stats_eager.summary())
+    finally:
+        runtime_budget.configure(original_budget / 60 if original_budget else None)
+        SessionManager.get_session = original
 
 
 def main():
     test_decode_task_list()
     test_answer_engine()
     test_config()
+    test_exam_priority_order()
+    test_exam_start_blocked_by_remaining_time()
     test_pipeline()
     print("\n全部离线自测通过")
 

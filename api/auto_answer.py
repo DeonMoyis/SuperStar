@@ -84,6 +84,11 @@ DEFAULT_ANSWER_CONFIG = {
     "max_tasks": 20,        # 每门课最多处理多少份, 防止跑飞
     "debug": False,         # 是否把原始 HTML 存盘
     "debug_dir": "answer_debug",
+    # 考试排到作业前面: 考试有截止时间, 作业相对宽松, 时间盒到点时不该先被作业吃掉
+    "exam_priority": True,
+    # 距本次运行上限不足 N 分钟就不开考: 考试一开考就开始倒计时,
+    # 中途被掐断会白白浪费一次考试机会, 不如留给下次
+    "exam_min_remaining": 15,
 }
 
 
@@ -121,6 +126,18 @@ def normalize_answer_config(raw: Optional[dict[str, Any]], tiku_cover_rate: floa
         config["max_tasks"] = DEFAULT_ANSWER_CONFIG["max_tasks"]
 
     config["debug_dir"] = str(raw.get("debug_dir") or config["debug_dir"]).strip()
+
+    config["exam_priority"] = as_bool(raw.get("exam_priority"), config["exam_priority"])
+    try:
+        config["exam_min_remaining"] = float(
+            raw.get("exam_min_remaining", config["exam_min_remaining"])
+        )
+    except (TypeError, ValueError):
+        logger.warning(
+            f"exam_min_remaining={raw.get('exam_min_remaining')!r} 无效, "
+            f"已回退为 {DEFAULT_ANSWER_CONFIG['exam_min_remaining']} 分钟"
+        )
+        config["exam_min_remaining"] = DEFAULT_ANSWER_CONFIG["exam_min_remaining"]
     return config
 
 
@@ -146,6 +163,8 @@ class AnswerStats:
     saved: int = 0
     skipped: int = 0
     failed: int = 0
+    # 因为剩余时间不够开考而推迟的考试数(不算跳过, 下次会重来)
+    postponed: int = 0
     reports: list[AnswerReport] = field(default_factory=list)
 
     @property
@@ -155,12 +174,15 @@ class AnswerStats:
         return sum(report.cover_rate for report in self.reports) / len(self.reports)
 
     def summary(self) -> str:
-        return (
+        text = (
             f"{self.course_title or '本课程'}: 发现 {self.tasks_found} 份, "
             f"作答 {self.answered} 份 (已提交 {self.submitted} / 仅保存 {self.saved}), "
             f"跳过 {self.skipped} 份, 失败 {self.failed} 份, "
             f"平均覆盖率 {self.avg_cover_rate * 100:.0f}%"
         )
+        if self.postponed:
+            text += f", 另有 {self.postponed} 份考试因剩余时间不足推迟到下次"
+        return text
 
 
 # ---------------------------------------------------------------- 列表解析
@@ -307,6 +329,13 @@ class AutoAnswer:
                 f"本次只处理前 {len(pending)} 份"
             )
 
+        # 考试排到作业前面: 作业不交还能补, 考试过了截止时间就没了。
+        # 用稳定排序, 同类内部仍然保持列表页原本的顺序。
+        if self.config["exam_priority"] and any(t.kind == "exam" for t in pending):
+            pending = sorted(pending, key=lambda item: 0 if item.kind == "exam" else 1)
+            exams = sum(1 for item in pending if item.kind == "exam")
+            logger.info(f"[自动答题] 考试优先: 先处理 {exams} 份考试, 再处理作业")
+
         for index, task in enumerate(pending, start=1):
             label = "作业" if task.kind == "work" else "考试"
             # 时间盒: 到点后不再开始新的作业/考试, 正在做的那份会做完
@@ -315,6 +344,13 @@ class AutoAnswer:
                 stats.skipped += remaining
                 logger.warning(f"[自动答题] 到达运行时长上限, 剩余 {remaining} 份不再处理")
                 break
+            # 考试一开考就开始倒计时, 中途被掐断等于白白浪费一次机会, 所以先看剩余时间
+            if task.kind == "exam":
+                blocked = self._exam_start_blocked()
+                if blocked:
+                    stats.postponed += 1
+                    logger.warning(f"[自动答题] 暂不开始考试《{task.title}》: {blocked}")
+                    continue
             logger.info(f"[自动答题] ({index}/{len(pending)}) {label}: {task.title}")
             try:
                 report = self._answer_task(task)
@@ -371,6 +407,26 @@ class AutoAnswer:
         return []
 
     # ------------------------------------------------------------ 单份作答
+    def _exam_start_blocked(self) -> str:
+        """剩余时间不足以做完一场考试时, 干脆别开考
+
+        超星点掉「开始考试」那一刻倒计时就开始走了, 如果随后因为运行时长上限、
+        Actions 超时或断网被掐断, 考试会停在「进行中」, 而考试次数通常有限,
+        等于白白浪费一次机会。返回空字符串表示可以开考。
+        """
+        threshold = self.config.get("exam_min_remaining") or 0
+        if threshold <= 0:
+            return ""
+        remaining = runtime_budget.remaining
+        if remaining is None:
+            return ""
+        if remaining < threshold * 60:
+            return (
+                f"本次运行只剩 {remaining / 60:.0f} 分钟, "
+                f"低于开考门槛 {threshold:g} 分钟, 留给下次运行"
+            )
+        return ""
+
     def _answer_task(self, task: AnswerTask) -> Optional[AnswerReport]:
         session = SessionManager.get_session()
         self._limit_rate()
