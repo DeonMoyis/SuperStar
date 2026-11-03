@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 import traceback
-from concurrent.futures.thread import ThreadPoolExecutor
+from concurrent.futures.thread import ThreadPoolExecutor  # noqa: F401  (保留导入, 兼容旧的外部引用)
 from dataclasses import dataclass, field
 from queue import Empty, PriorityQueue
 from threading import RLock
@@ -117,6 +117,11 @@ def parse_args():
         help="答题后如何提交: auto-覆盖率达标才提交, always-总是提交, never-只保存"
     )
     parser.add_argument(
+        "--answer-order", type=str, default=None,
+        choices=["before", "after", "both"],
+        help="作业/考试与刷课的先后: after-刷完再做(默认), before-先做题再刷课, both-前后各扫一遍"
+    )
+    parser.add_argument(
         "--answer-debug", action="store_true",
         help="把抓到的作业/考试原始页面存到 answer_debug/ 目录, 用于排查解析问题"
     )
@@ -202,6 +207,9 @@ def load_config_from_file(config_path):
     # 检查并读取answer节(作业/考试自动答题)
     if config.has_section("answer"):
         common_config["answer"] = dict(config.items("answer"))
+        # 作业与刷课的先后顺序, 写在 [answer] order 里
+        if common_config["answer"].get("order"):
+            common_config["answer_order"] = common_config["answer"]["order"].strip().lower()
 
     # 检查并读取ai节(DeepSeek 搜题答题)
     if config.has_section("ai"):
@@ -245,6 +253,7 @@ def build_config_from_args(args):
         "verbose": args.verbose,
         "answer_only": getattr(args, "answer_only", False),
         "answer": answer_config,
+        "answer_order": getattr(args, "answer_order", None) or "after",
         "ai": ai_config,
     }
     return common_config, {}, {}
@@ -274,6 +283,9 @@ def init_config():
             answer_raw["exam"] = "true" if args.answer_exam else "false"
         common_config["answer"] = answer_raw
         common_config["answer_only"] = getattr(args, "answer_only", False)
+        # --answer-order 覆盖 [answer] order
+        if getattr(args, "answer_order", None):
+            common_config["answer_order"] = args.answer_order
 
         # 命令行给的 DeepSeek 参数优先级最高
         ai_raw = dict(common_config.get("ai", {}))
@@ -290,7 +302,7 @@ def init_config():
 
 
 
-def init_chaoxing(common_config, tiku_config):
+def init_chaoxing(common_config, tiku_config, answer_config=None):
     """初始化超星实例"""
     username = common_config.get("username", "")
     password = common_config.get("password", "")
@@ -330,7 +342,15 @@ def init_chaoxing(common_config, tiku_config):
     query_delay = tiku_config.get("delay", 0)
     
     # 实例化超星API
-    chaoxing = Chaoxing(account=account, tiku=tiku, query_delay=query_delay)
+    # ai_solver: 章节测验(每小节那份作业)也能用大模型作答, 不再只依赖题库
+    # answer_policy: 章节测验的提交策略, 与作业/考试共用 [answer] 配置
+    solver = get_default_solver()
+    chaoxing = Chaoxing(
+        account=account, tiku=tiku, query_delay=query_delay,
+        ai_solver=solver,
+        ai_mode=getattr(getattr(solver, "config", None), "mode", "fallback"),
+        answer_policy=answer_config or {},
+    )
     
     return chaoxing
 
@@ -529,7 +549,8 @@ class JobProcessor:
                     logger.debug(f"unfinished task: {self.task_queue.unfinished_tasks}")
 
                 case ChapterResult.SKIPPED:
-                    logger.info("到达运行时长上限, 跳过章节: {}", task.point["title"])
+                    # 两种来源: 到达单次运行时长上限, 或任务点卡住(片尾仍不认通过)主动放弃
+                    logger.info("跳过章节(时长上限或任务点卡死): {}", task.point["title"])
                     if task not in self.skipped_tasks:
                         self.skipped_tasks.append(task)
                     self.task_queue.task_done()
@@ -616,12 +637,30 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     if not jobs:
         pass
 
-    # TODO: 个别章节很恶心，多到5个点，可以并行处理，将来会让不同课程不同章节的所有任务点共享一个队列，从而实现全局并行
-    job_results:list[StudyResult]=[]
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for result in executor.map(lambda job: process_job(chaoxing, course, job, job_info, speed), jobs):
-            job_results.append(result)
-    
+    # 任务点必须按「先把内容学完, 再做本节测验/作业」的顺序走。
+    # 旧实现是 ThreadPoolExecutor(5) 把整章任务点一起塞进去, 有两个问题:
+    #   1. 视频在排队等播放位, 章节测验却可能先抢到作答位先跑, 表现为
+    #      "视频还没看完就去答题"; 而超星的章节测验大多要求先学完本节内容;
+    #   2. 章节内有多个视频时 Semaphore 不保证公平, 播放顺序是乱的。
+    # 1 倍速下视频本来就是串行的, 并发并没有收益, 这里改为按页面顺序依次处理。
+    job_results: list[StudyResult] = []
+    content_jobs = [j for j in jobs if j.get("type") != "workid"]
+    quiz_jobs = [j for j in jobs if j.get("type") == "workid"]
+    ordered_jobs = content_jobs + quiz_jobs
+
+    for idx, job in enumerate(ordered_jobs):
+        if runtime_budget.should_stop():
+            job_results.append(StudyResult.SKIPPED)
+            continue
+        if quiz_jobs and idx == len(content_jobs):
+            logger.info(f"本节内容已学完, 开始做本节测验/作业: {point['title']}")
+        try:
+            job_results.append(process_job(chaoxing, course, job, job_info, speed))
+        except Exception as exc:
+            logger.error(f"任务点处理异常 -> {job.get('name')}: {type(exc).__name__}: {exc}")
+            logger.error(traceback.format_exc())
+            job_results.append(StudyResult.ERROR)
+
     for result in job_results:
         if result.is_failure():
             return ChapterResult.ERROR
@@ -749,8 +788,13 @@ def main():
         else:
             logger.info("[AI] 未配置 DeepSeek API Key, AI 搜题答题未启用")
         
+        # 作业/考试/章节测验共用同一份答题配置(题库没配好时也能跑, 只是覆盖率会低)
+        answer_config = normalize_answer_config(
+            common_config.get("answer"), tiku_config.get("cover_rate", 0.9)
+        )
+
         # 初始化超星实例
-        chaoxing = init_chaoxing(common_config, tiku_config)
+        chaoxing = init_chaoxing(common_config, tiku_config, answer_config)
         
         # 设置外部通知
         notification = Notification()
@@ -770,9 +814,6 @@ def main():
         course_task = filter_courses(all_course, common_config.get("course_list"))
 
         # 作业/考试自动答题配置(题库没配好时也能跑, 只是覆盖率会低)
-        answer_config = normalize_answer_config(
-            common_config.get("answer"), tiku_config.get("cover_rate", 0.9)
-        )
         answer_only = bool(common_config.get("answer_only", False))
         if answer_config["enable"]:
             logger.info(
@@ -783,40 +824,63 @@ def main():
         else:
             logger.info("自动答题: 未启用 (需要 --auto-answer / --answer-only 或 [answer] enable=true)")
 
+        # ---- 作业/考试答题器 ----
+        auto_answer = AutoAnswer(chaoxing, answer_config, ai_solver=ai_solver) if answer_config["enable"] else None
+        stats_list = []
+
+        def answer_course(course: dict, stage: str) -> None:
+            """对单门课程扫一遍作业/考试"""
+            if auto_answer is None:
+                return
+            if runtime_budget.should_stop():
+                logger.warning("[自动答题] 已达到单次运行时长上限, 不再处理剩余课程")
+                return
+            logger.info(f"[自动答题] {stage}扫描: {course.get('title')}")
+            try:
+                stats_list.append(auto_answer.run_course(course))
+            except Exception as exc:
+                logger.error(f"[自动答题] 课程 {course.get('title')} 处理异常: {type(exc).__name__}: {exc}")
+                logger.error(traceback.format_exc())
+
+        # 作业和刷课的先后顺序:
+        #   after  - 先刷视频/文档, 再做这门课的作业/考试(默认)
+        #   before - 先做题再刷课
+        #   both   - 前后各扫一遍
+        # 默认 after 的原因: 作业和考试基本都是「看完前面几节才解锁」,
+        # 先做会撞上"未开始/未解锁"而白跑。注意这里是**每门课内部**的顺序,
+        # 不是所有课刷完才统一做题 —— 第 1 门课的作业做完才进第 2 门课,
+        # 所以即使中途撞上时长上限, 前面几门课也是"视频+作业"都完整的。
+        answer_order = str(common_config.get("answer_order") or "after").lower()
+
         # 开始学习
         if answer_only:
             logger.info("已启用 --answer-only, 本次跳过视频/文档等任务点, 只做作业和考试")
+            for course in course_task:
+                answer_course(course, "唯一一轮")
         else:
             logger.info(f"课程列表过滤完毕, 当前课程任务数量: {len(course_task)}")
             for course in course_task:
                 if runtime_budget.should_stop():
                     logger.warning("已达到单次运行时长上限, 不再开始新的课程")
                     break
+                if answer_order in ("before", "both"):
+                    answer_course(course, "刷课前")
                 process_course(chaoxing, course, common_config)
+                if answer_order in ("after", "both"):
+                    answer_course(course, "刷课后")
             logger.info("所有课程学习任务已完成")
 
-        # 作业 + 考试自动答题
+        # ---- 汇总 ----
         answer_summary = ""
-        if answer_config["enable"]:
-            logger.info("开始作业/考试自动答题...")
-            auto_answer = AutoAnswer(chaoxing, answer_config, ai_solver=ai_solver)
-            stats_list = []
-            for course in course_task:
-                if runtime_budget.should_stop():
-                    logger.warning("[自动答题] 已达到单次运行时长上限, 不再处理剩余课程")
-                    break
-                try:
-                    stats_list.append(auto_answer.run_course(course))
-                except Exception as exc:
-                    logger.error(f"[自动答题] 课程 {course.get('title')} 处理异常: {type(exc).__name__}: {exc}")
-                    logger.error(traceback.format_exc())
-            if stats_list:
-                answer_summary = "\n".join(stats.summary() for stats in stats_list)
-                logger.info("自动答题汇总:\n" + answer_summary)
+        if stats_list:
+            answer_summary = "\n".join(stats.summary() for stats in stats_list)
+            logger.info("自动答题汇总:\n" + answer_summary)
             # AI 用量统计, 方便估算花了多少钱
             solver = get_default_solver()
             if solver and solver.available and solver.requests:
                 logger.info(f"[AI] 本次用量: {solver.stats()}")
+        elif answer_config["enable"]:
+            logger.info("自动答题已启用, 但本次没有扫描到待处理的作业/考试")
         else:
             logger.info("未启用自动答题, 如需作答作业/考试请加 --auto-answer 或配置 [answer] enable=true")
 

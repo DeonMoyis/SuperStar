@@ -179,6 +179,8 @@ class AnswerEngine:
     def _solve_by_tiku(self, question: dict[str, Any], q_type: str, options: str) -> tuple[str, str]:
         if self._tiku_disabled():
             return "", ""
+        if self.query_delay:
+            time.sleep(self.query_delay)
         try:
             resolved = self.tiku.query(question) or ""
         except Exception as exc:  # 题库挂了不能拖垮整份作业
@@ -407,6 +409,14 @@ class AnswerEngine:
 
     def _tiku_disabled(self) -> bool:
         return self.tiku is None or getattr(self.tiku, "DISABLE", False)
+
+    def has_answer_source(self) -> bool:
+        """是否至少有一个能给出答案的来源(题库或大模型)
+
+        两者都没有时只能随机作答, 对章节测验这种要计入成绩的场景没有意义,
+        调用方应该直接跳过, 而不是答一串随机答案再提交。
+        """
+        return (not self._tiku_disabled()) or bool(self.ai_solver)
 
 
 def build_submit_payload(questions: dict[str, Any], report: AnswerReport) -> dict[str, Any]:

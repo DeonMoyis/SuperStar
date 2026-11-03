@@ -61,6 +61,10 @@ jobs:
           #   留空 / true -> 考试也自动做
           #   false       -> 跳过考试, 只做作业(考试有次数限制, 想自己考就设 false)
           ANSWER_EXAM: ${{ vars.ANSWER_EXAM }}
+          # 可选: 作业和刷课谁先做 (before / after / both), 默认 before
+          #   before -> 先做作业再刷视频, 视频刷不完也不会漏作业
+          #   both   -> 刷课前后各扫一遍, 能补上刷课过程中才解锁的作业
+          ANSWER_ORDER: ${{ vars.ANSWER_ORDER }}
           # 单次运行时长上限(分钟):
           #   手动触发时填的值 > 仓库 Variables 里的 MAX_RUNTIME_MINUTES > 默认 110
           MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime || vars.MAX_RUNTIME_MINUTES || '110' }}
@@ -89,6 +93,10 @@ jobs:
               echo "本次不处理考试, 只做作业"
             else
               echo "本次同时处理作业和考试"
+            fi
+            # 作业与刷课的先后顺序
+            if [ -n "$ANSWER_ORDER" ]; then
+              args+=(--answer-order "$ANSWER_ORDER")
             fi
           else
             echo "本次不处理作业/考试"
