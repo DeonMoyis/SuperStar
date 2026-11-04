@@ -361,6 +361,68 @@ Actions 页面上有两个地方，别搞混：
 - 费用参考：一份 30 题的作业约几分钱，缓存命中后不再产生费用；
 - 只回答问题本身，不做任何浏览器自动化。
 
+### AI 答错了怎么改：`manual_answers.json`
+
+大模型答错是常事，尤其是判断题、还有「以下哪项**不属于**」这种反向题。项目里有两层缓存，但**都不适合用来纠错**：
+
+| 缓存 | 为什么不能拿它纠错 |
+| --- | --- |
+| `ai_cache.json`（AI 答案） | 被 `.gitignore` 忽略，Actions 里又由 `actions/cache` 恢复，**你提交上去的版本会被缓存盖回去**；key 里还带缓存版本号和模型名，提示词一改整批失效 |
+| `cache.json`（题库缓存） | 只在配了 `[tiku] provider` 时才启用；key 是原始题干，多一个空格就 miss |
+
+所以纠错走一个专门的、跟着仓库走的文件：`manual_answers.json`。
+
+**它优先级最高**：人工答案 > 题库 > 大模型 > 随机。命中就直接用，题库和 AI 都不会被调用（省钱）。
+
+**怎么用，三步：**
+
+1. 打开根目录的 `manual_answers.json`，在 `entries` 里加一条：
+
+   ```json
+   {
+     "title": "经济实力影响和制约着国家的国防、科技、教育等实力，所以说，经济安全事关国家的国际地位。",
+     "type": "judgement",
+     "answer": "错误",
+     "course": "形势与政策",
+     "note": "AI 答成了「正确」，实测是错的"
+   }
+   ```
+
+2. `answer` 按你习惯的写法填就行，程序会自己转成超星要的格式：
+
+   | 题型 | 可以怎么写 |
+   | --- | --- |
+   | 判断题 | `正确` / `错误` / `对` / `错` / `√` / `×` / `true` / `false` |
+   | 单选题 | `A`，或者直接抄选项原文（`经济安全`） |
+   | 多选题 | `ABD`，乱序、小写、带逗号（`d,a,b`）都认 |
+   | 填空题 | 原文，多个空用 `|` 或换行分隔 |
+
+3. `commit` + `push`。之后你跑、别人 fork 下来跑，命中这道题都用你写的答案。
+
+**题干不用抄得一模一样。** 匹配前会统一抹掉题号、`【判断题】` 这类标记、`（1.0分）` 后缀、空格和全部中英文标点；所以下面几种写法认为是同一道题：
+
+```
+1【判断题】经济安全事关国家的国际地位。（）（1.0分）
+经济安全事关国家的国际地位
+判断题：经济安全事关国家的国际地位！
+```
+
+也支持**只写题干的一部分**（≥ 8 个字，按包含匹配），以及题干有错别字/微调时的相似度兜底（阈值 0.95）。但不相干的题不会被"相似"进来 —— 错用一条答案比没有答案更糟。
+
+**不知道哪些题答错了？** 从运行日志里把做过的题捞出来，生成一份待核对的骨架：
+
+```bash
+python tools/extract_answers.py              # 读 chaoxing.log
+python tools/extract_answers.py run.log      # 也可以喂下载下来的 Actions 日志
+```
+
+生成的条目里 `answer` 是当时程序给的答案，`note` 写着来源；你只需要把答错的改掉。
+
+⚠️ 两点说明：
+
+- **已经提交过的作业/测验改不了** —— 超星那边成绩已经落地。这份答案本只对「之后的作答」和「别人跑」生效；
+- 想让某条失效，删掉那条、或者加 `"disabled": true`；临时整体关掉用 `--no-manual-answers`。
+
 ---
 
 ## 本地运行 / Docker
@@ -514,6 +576,8 @@ python main.py --help
 | `--video-debug` | 保存卡住视频的卡片/状态/响应，排查「刷不过去」 |
 | `--skip-face-capture` / `--no-skip-face-capture` | 开了人脸采集的视频是否直接跳过（默认跳过） |
 | `--skip-registry` | 跳过记录簿路径，默认 `skip_registry.json` |
+| `--answers-file` | 人工校订答案文件，默认 `manual_answers.json` |
+| `--manual-answers` / `--no-manual-answers` | 是否使用人工校订答案（默认用，`--no-manual-answers` 临时忽略） |
 | `--deepseek-key` | DeepSeek Key |
 | `--ai-model` | 模型名，默认 `deepseek-flash` |
 | `--ai-mode` | `fallback` / `priority` / `off` |
@@ -597,6 +661,9 @@ DeepSeek 需要充值，新账号赠送额度用完后返回 402。
 **Q：作业/考试没解析出题目？**
 用 `--answer-debug` 跑一次，原始页面会存到 `answer_debug/`。看是列表页还是答题页结构变了（列表页一条都没解析出来时，即使没开 debug 也会自动存）。
 
+**Q：AI 答错了几道题，能把答案改对吗？改完给别人跑也用这份答案？**
+能。写进根目录的 `manual_answers.json`，优先级最高（压过题库和 AI 缓存），跟着仓库走。**不要**去改 `ai_cache.json` —— 它在 `.gitignore` 里，Actions 又用 `actions/cache` 把它恢复回来，改完推上去会被盖回去。做法和字段写法见 [AI 答错了怎么改](#ai-答错了怎么改manual_answersjson)。
+
 **Q：某个视频进度到 100% 了，日志却报「任务点卡死」或「进度已到片尾但仍未通过」？**
 
 说明这个任务点靠上报进度已经推不动了，服务端不认。加 `--video-debug` 重跑一次，日志和 `video_debug/` 会直接告诉你是哪一种：
@@ -649,22 +716,27 @@ SuperStar/
 │   ├── playback.py          # 播放/作答节奏：1 倍速 + 播放位/作答位
 │   ├── runtime_budget.py    # 单次运行时长上限（时间盒）
 │   ├── skip_registry.py     # 任务点跳过记录簿：为什么跳过、下次还试不试
+│   ├── manual_answers.py    # 人工校订答案：AI 答错的题钉死正确答案，跟着仓库走
 │   ├── video_quiz.py        # 视频内弹窗题：解析、选项映射、提交
 │   ├── font_decoder.py      # 超星字体加密解密
 │   ├── notification.py      # 外部通知
 │   └── live.py / live_process.py
+├── tools/
+│   └── extract_answers.py   # 从运行日志捞出做过的题，生成人工答案骨架
+├── manual_answers.json      # 人工校订答案（里面的示例条目 disabled，不生效）
 ├── tests/                   # 离线自测，不需要账号和 Key
 └── docs/技术文档.md          # 深入原理与二次开发
 ```
 
 ### 本地自测
 
-九个测试全部**离线**，用假的 HTTP 响应跑完整链路，不需要登录也不需要 API Key：
+十个测试全部**离线**，用假的 HTTP 响应跑完整链路，不需要登录也不需要 API Key：
 
 ```bash
 pip install -r requirements.txt
 python tests/test_auto_answer.py     # 列表解析 / 作答匹配 / 提交策略 / 考试开关
 python tests/test_ai_solver.py       # JSON 解析 / 字母纠错 / 缓存 / 深度思考参数
+python tests/test_manual_answers.py  # 人工答案：题干归一化匹配 / 答案格式 / 优先级与覆盖率
 python tests/test_chapter_order.py   # 章节内顺序：先内容，再本节测验
 python tests/test_skip_registry.py   # 人脸采集直接跳过 / 跳过记录跨运行生效
 python tests/test_video_quiz.py      # 弹窗题解析 / 选项映射 / 到点提交

@@ -1638,14 +1638,14 @@ class Chaoxing:
         )
         for solved in report.solved:
             q = solved.question
-            # cover = 有可靠来源的答案(题库或大模型); 下面拼提交表单时只有 cover 才会真的提交
-            if solved.source in ("tiku", "ai"):
+            # cover = 有可靠来源的答案(人工校订/题库/大模型); 下面拼提交表单时只有 cover 才会真的提交
+            if solved.source in ("manual", "tiku", "ai"):
                 q[f'answerSource{q["id"]}'] = "cover"
                 found_answers += 1
             else:
                 q[f'answerSource{q["id"]}'] = "random"
         cover_rate = (found_answers / total_questions) * 100 if total_questions else 0.0
-        logger.info(f"章节检测答题覆盖率： {cover_rate:.0f}% (题库 + 大模型)")
+        logger.info(f"章节检测答题覆盖率： {cover_rate:.0f}% (人工 + 题库 + 大模型)")
         # 提交策略与大模型下的作业/考试保持一致, 不再只看 [tiku] submit:
         #   auto   - 覆盖率达标才提交
         #   always - 直接提交
