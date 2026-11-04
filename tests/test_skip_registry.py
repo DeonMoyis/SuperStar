@@ -8,8 +8,12 @@
 
 现在的规则:
   1. 播放之前就能认出人脸采集 -> 直接跳过, 一次上报都不发;
-  2. 跳过原因写进记录簿(skip_registry.json), permanent 条目下次运行直接跳;
-  3. 403/风控这类「下次可能还能成」的原因只记录, 不阻止下次重试。
+     **但判定口径很严**: 只认明确的开关字段和像真密文的凭据, 字段非空不算
+     (旧口径把「视频中间插了一道题」的课程误判成人脸, 整节跳过);
+  2. 卡片/接口里带弹窗题的视频**不按人脸跳过** —— 卡住的真实原因是题没答;
+  3. 跳过原因写进记录簿(skip_registry.json), permanent 条目下次运行直接跳;
+     旧版(v1)的人脸结论会在加载时丢弃, 那些视频重新走一遍判定;
+  4. 403/风控这类「下次可能还能成」的原因只记录, 不阻止下次重试。
 """
 import json
 import os
@@ -162,11 +166,99 @@ def test_face_capture_video_skipped_without_any_request():
     print(f"[ok] 人脸采集视频: 0 次上报, {elapsed:.2f}s 直接跳过, 原因已落盘")
 
 
+def test_quiz_video_is_not_skipped_as_face_capture():
+    """带弹窗题的视频即使有人脸标记也要照常播放
+
+    这就是用户核对出来的那种情况: 卡片里其实只是一道视频中的题目,
+    被旧口径误判成「人脸采集」整节跳过, 任务点一直空着。
+    """
+    setup_base()
+    configure_default_registry(os.path.join(tempfile.mkdtemp(), "skip_registry.json"))
+    chaoxing, calls = make_chaoxing()
+
+    job = {
+        "jobid": "555", "objectid": "obj-555", "name": "带弹窗题的视频.mp4",
+        "playTime": 0,
+        # 明确开关为 1(即使真的开了人脸), 但卡片里有题 -> 应该照常播
+        "videoFaceCapture": 1,
+        "raw_card": {
+            "jobid": "555", "type": "video", "videoFaceCapture": 1,
+            "property": {
+                "name": "带弹窗题的视频.mp4",
+                "questions": [{
+                    "id": "q1", "title": "经济安全的基础是什么?",
+                    "options": "A.军事力量\nB.经济实力", "type": "single", "time": 1,
+                }],
+            },
+        },
+    }
+    real_sleep = time.sleep
+    time.sleep = lambda *_: None
+    try:
+        result = chaoxing.study_video({"courseId": "1", "title": "课"}, job, {})
+    finally:
+        time.sleep = real_sleep
+
+    assert result == base.StudyResult.SUCCESS, f"有题就该照常播完, 实际 {result}"
+    assert calls, "应该真的发进度上报, 而不是被跳过"
+    assert not chaoxing.skipped_points, "不该记成跳过"
+    print("[ok] 带弹窗题的视频: 即使有脸标记也照常播放, 不会被误跳")
+
+
+def test_legacy_face_record_is_dropped():
+    """旧版(v1)的「人脸采集」结论不可信: 加载时丢弃, 视频重新走一遍判定"""
+    path = os.path.join(tempfile.mkdtemp(), "skip_registry.json")
+    payload = {
+        "version": 1,
+        "entries": {
+            "video:old-1": {
+                "key": "video:old-1", "kind": "video", "name": "被误判的视频.mp4",
+                "reason_code": REASON_FACE_CAPTURE, "reason": "该视频开启人脸采集",
+                "permanent": True, "attempts": 1,
+            }
+        },
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+    reg = SkipRegistry(path)
+    assert reg.stats()["total"] == 0, f"v1 的人脸记录应被丢弃, 实际 {reg.stats()}"
+    print("[ok] 旧版人脸记录: 加载时丢弃, 视频会被重新检查")
+
+
+def test_stale_face_record_revoked_on_recheck():
+    """记录簿里还留着旧的人脸记录, 但按新口径复核不成立 -> 撤销并照常播放"""
+    setup_base()
+    path = os.path.join(tempfile.mkdtemp(), "skip_registry.json")
+    job = {"jobid": "888", "objectid": "obj-888", "name": "被误判的视频.mp4",
+           "playTime": 0, "videoFaceCaptureEnc": "0"}
+
+    old = SkipRegistry(path)
+    old.record("video", job, REASON_FACE_CAPTURE, course="某课")
+    old.save(force=True)
+
+    configure_default_registry(path)
+    chaoxing, calls = make_chaoxing()
+    real_sleep = time.sleep
+    time.sleep = lambda *_: None
+    try:
+        result = chaoxing.study_video({"courseId": "1", "title": "某课"}, job, {})
+    finally:
+        time.sleep = real_sleep
+
+    assert result == base.StudyResult.SUCCESS, f"复核不成立应照常播, 实际 {result}"
+    assert calls, "应该真的发进度上报"
+    assert get_default_registry().get("video", job) is None, "过期记录应被撤销"
+    print("[ok] 旧记录复核: 不成立时撤销, 视频照常播放")
+
+
 def test_recorded_permanent_skips_next_run():
     """跨运行: 上次记为永久跳过, 这次开播前就不试了"""
     setup_base()
     path = os.path.join(tempfile.mkdtemp(), "skip_registry.json")
-    job = {"jobid": "777", "name": "上次已放弃的视频.mp4"}
+    # 带上真密文, 这样「复核」仍然成立, 才会真的跳过
+    job = {"jobid": "777", "name": "上次已放弃的视频.mp4",
+           "videoFaceCaptureEnc": "701f717922e30129e914bcec53d18d3f"}
 
     old = SkipRegistry(path)
     old.record("video", job, REASON_FACE_CAPTURE, course="某课")
@@ -216,7 +308,7 @@ def test_switch_can_be_turned_off():
         chaoxing.study_video({"courseId": "1", "title": "课"},
                              {"jobid": "999", "objectid": "obj-999",
                               "name": "人脸视频.mp4", "playTime": 0,
-                              "videoFaceCaptureEnc": "abc"}, {})
+                              "videoFaceCaptureEnc": "701f717922e30129e914bcec53d18d3f"}, {})
     finally:
         time.sleep = real_sleep
 
@@ -229,6 +321,9 @@ if __name__ == "__main__":
     test_retryable_reason_not_permanent()
     test_summary_lines_readable()
     test_face_capture_video_skipped_without_any_request()
+    test_quiz_video_is_not_skipped_as_face_capture()
+    test_legacy_face_record_is_dropped()
+    test_stale_face_record_revoked_on_recheck()
     test_recorded_permanent_skips_next_run()
     test_no_face_capture_still_plays()
     test_switch_can_be_turned_off()

@@ -1,6 +1,13 @@
 name: 刷课
  
 on: 
+  # 只保留两种「你要它跑它才跑」的启动方式, 不再挂定时任务。
+  #
+  # 为什么去掉 schedule: GitHub 的 cron 是「尽力而为」, 高峰期经常延迟十几分钟到
+  # 一小时, 甚至整次跳过 —— 想按固定时间刷课根本对不上。现在改成:
+  #   * 手动触发: Actions 页面 -> 刷课 -> Run workflow(可以顺手填本次时长);
+  #   * 推一次 commit 也会触发(push 到 main), 改完代码提交即开跑。
+  # 一次运行跑到 MAX_RUNTIME_MINUTES 就自己收尾退出, 下次等你再手动开。
   push:
     branches: [ main ]
   workflow_dispatch:   # 支持在 Actions 页面手动触发
@@ -9,19 +16,6 @@ on:
         description: "本次运行时长上限(分钟)。留空则用仓库变量 MAX_RUNTIME_MINUTES, 都没设就是 110"
         required: false
         default: ""
-
-  # ===== 分段刷课: 取消下面两行注释即可启用 =====
-  # 每次跑 MAX_RUNTIME_MINUTES 分钟就退出, 隔一段时间由 Actions 再触发下一次,
-  # 相当于"每天学几段", 比一次跑完全部更接近真人节奏。
-  # 下面表示每 4 小时跑一次(0/4/8/12/16/20 点), 一天 6 次。
-  #
-  # 注意 Actions 免费额度: 私有仓库每月 2000 分钟。
-  #   每次 110 分钟 x 每天 6 次 = 660 分钟/天, 一个月远超免费额度。
-  #   想长期跑建议把时长调到 30~60 分钟, 或把频率降到每天 1~2 次。
-  # ===== 分段刷课: 每天两次 =====
-  # 每次跑满 MAX_RUNTIME_MINUTES 分钟就退出, 由 Actions 下次定时触发接上。
-  schedule:
-    - cron: "0 2,14 * * *"
 
 
 jobs: 

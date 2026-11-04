@@ -34,7 +34,9 @@ from typing import Any, Optional
 from loguru import logger
 
 DEFAULT_REGISTRY_FILE = "skip_registry.json"
-REGISTRY_VERSION = 1
+# v2: 人脸采集的判定口径收紧了(不再「字段非空即人脸」), 旧结论一律作废。
+# 见 _LEGACY_DROP_REASONS。
+REGISTRY_VERSION = 2
 
 # 原因码
 REASON_FACE_CAPTURE = "face_capture"
@@ -45,6 +47,11 @@ REASON_RUNTIME_BUDGET = "runtime_budget"
 
 # 重试多少次都不会变的原因: 只有这些才值得"下次直接跳过"
 PERMANENT_REASONS = {REASON_FACE_CAPTURE}
+
+# 记录簿格式升级时, 哪些旧结论不能再沿用。
+# v1 的 face_capture 是「videoFaceCaptureEnc 非空」就下的结论, 实测误判了大量
+# 只是「视频中间有弹窗题」的课程, 导致整节视频被播前跳过、任务点空着。
+_LEGACY_DROP_REASONS = {REASON_FACE_CAPTURE}
 
 # 给用户看的中文说明
 REASON_TEXT = {
@@ -102,9 +109,26 @@ class SkipRegistry:
         entries = data.get("entries") if isinstance(data, dict) else None
         if not isinstance(entries, dict):
             return
+        try:
+            version = int(data.get("version") or 1)
+        except (TypeError, ValueError):
+            version = 1
+
+        dropped = 0
         for key, entry in entries.items():
-            if isinstance(entry, dict):
-                self._entries[str(key)] = entry
+            if not isinstance(entry, dict):
+                continue
+            # 旧版本里「因人脸采集而永久跳过」的结论不可信, 丢弃后重新判定
+            if version < REGISTRY_VERSION and entry.get("reason_code") in _LEGACY_DROP_REASONS:
+                dropped += 1
+                continue
+            self._entries[str(key)] = entry
+        if dropped:
+            logger.warning(
+                "[跳过记录] 丢弃 {} 条旧版「人脸采集」记录(判定口径已修正, 本次重新检查)",
+                dropped,
+            )
+            self._dirty = True
         if self._entries:
             permanent = sum(1 for e in self._entries.values() if e.get("permanent"))
             logger.info(
@@ -175,6 +199,21 @@ class SkipRegistry:
     def get(self, kind: str, job: dict) -> Optional[dict]:
         with self._lock:
             return self._entries.get(make_key(kind, job))
+
+    def forget(self, kind: str, job: dict) -> bool:
+        """删掉某条记录(复核后确认上次的结论是误判时用)"""
+        key = make_key(kind, job)
+        with self._lock:
+            if key not in self._entries:
+                return False
+            entry = self._entries.pop(key)
+            self._dirty = True
+            self.save()
+        logger.info(
+            "[跳过记录] 撤销一条记录(复核后不成立): {} | {}",
+            entry.get("name") or key, entry.get("reason") or entry.get("reason_code"),
+        )
+        return True
 
     def should_skip(self, kind: str, job: dict) -> Optional[dict]:
         """上次已判定为「重试也没用」时才返回记录, 否则 None"""
@@ -249,6 +288,14 @@ def should_skip(kind: str, job: dict) -> Optional[dict]:
     if registry is None:
         return None
     return registry.should_skip(kind, job)
+
+
+def forget_skip(kind: str, job: dict) -> bool:
+    """撤销一条记录, 没配置记录簿时返回 False"""
+    registry = get_default_registry()
+    if registry is None:
+        return False
+    return registry.forget(kind, job)
 
 
 def release_default_registry(save: bool = True) -> None:

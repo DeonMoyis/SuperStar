@@ -15,7 +15,89 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
+
+# ===== 人脸采集判定 =====
+# 这里曾经踩过一个坑: 只要卡片里的 videoFaceCaptureEnc 非空就判定「开了人脸采集」,
+# 于是整节视频被播前跳过。实测很多**没有**人脸采集的视频卡片里同样带着这个字段
+# (值可能是 "0"、空占位、或与本节课无关的短串), 结果把「视频中间有弹窗题没答」
+# 误诊成人脸, 任务点白白空着。
+#
+# 现在只有下面两类证据才算数:
+#   1. 明确的开关字段为真(videoFaceCapture / faceCapture 取 1/true);
+#   2. 加密凭据确实像真密文(足够长 + 十六进制/Base64 字符集, 形如 701f7179...)。
+FACE_FLAG_FIELDS = (
+    "videoFaceCapture", "faceCapture", "isFaceCapture",
+    "faceCaptureStatus", "videoFaceCaptureStatus",
+)
+FACE_ENC_FIELDS = ("videoFaceCaptureEnc", "faceCaptureEnc")
+FACE_FALSY = {"", "0", "false", "no", "n", "none", "null", "undefined", "false."}
+FACE_ENC_MIN_LEN = 24
+
+_FLAG_TRUE = {"1", "true", "yes", "y", "on"}
+
+
+def truthy_flag(value: Any) -> bool:
+    """严格解释 0/1 语义的开关
+
+    和 Python 的 `bool()` 不同: 字符串 "0" / "false" 一律当假。
+    超星大量字段用 "0" 表示关闭, 直接判真假会把「关闭」当成「开启」。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in FACE_FALSY:
+            return False
+        return text in _FLAG_TRUE
+    if isinstance(value, dict):
+        for key in ("open", "enabled", "status", "isOpen", "value", "videoFaceCapture"):
+            if key in value:
+                return truthy_flag(value[key])
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(truthy_flag(item) for item in value)
+    return False
+
+
+def looks_like_face_cipher(value: Any) -> bool:
+    """这个字符串像不像真的「人脸采集加密凭据」
+
+    真密文是长串十六进制(实测形如 701f7179...)。短串、"0"、纯数字占位符都不算。
+    """
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if len(text) < FACE_ENC_MIN_LEN:
+        return False
+    return bool(re.fullmatch(r"[0-9a-fA-F+/=_-]+", text))
+
+
+def detect_face_capture(node: Any, depth: int = 3) -> bool:
+    """在任务卡片 / status 响应里判断是否真的开启了人脸采集
+
+    只看「明确开关」和「像真密文的凭据」, 不再仅凭字段存在就下结论。
+    """
+    if not isinstance(node, dict) or depth < 0:
+        return False
+
+    for field in FACE_FLAG_FIELDS:
+        if truthy_flag(node.get(field)):
+            return True
+    for field in FACE_ENC_FIELDS:
+        if looks_like_face_cipher(node.get(field)):
+            return True
+
+    # property / raw_card 等嵌套对象里再找一层(部分课程把开关放在 property 下)
+    if depth > 0:
+        for key in ("raw_card", "property", "videoInfo", "video", "data"):
+            child = node.get(key)
+            if isinstance(child, dict) and detect_face_capture(child, depth - 1):
+                return True
+    return False
 
 # 题干字段候选(按优先级)
 _TITLE_KEYS = ("title", "question", "content", "stem", "qtitle", "name", "description")
@@ -266,19 +348,19 @@ def summarize_video_card(raw_card: Any) -> dict:
 
     questions = find_inline_questions(raw_card)
     property_data = raw_card.get("property") or {}
-    face_enc = raw_card.get("videoFaceCaptureEnc") or ""
+    face_capture = detect_face_capture(raw_card)
 
     summary = {
         "ok": True,
         "top_keys": sorted(raw_card.keys())[:24],
         "property_keys": sorted(property_data.keys())[:24] if isinstance(property_data, dict) else [],
-        "has_face_capture": bool(face_enc),
+        "has_face_capture": face_capture,
         "question_count": len(questions),
         "questions": questions,
     }
     if questions:
         summary["reason"] = "卡片里带弹窗题"
-    elif face_enc:
+    elif face_capture:
         summary["reason"] = "该视频开启人脸采集, 纯 HTTP 无法完成"
     else:
         summary["reason"] = "卡片里没发现弹窗题, 也不像人脸采集(可能是服务端状态或风控)"

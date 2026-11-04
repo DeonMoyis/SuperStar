@@ -33,6 +33,7 @@ from api.decode import (
 from api.video_quiz import (
     QUIZ_HOST,
     QUIZ_LIST_URLS,
+    detect_face_capture,
     dump_json,
     find_inline_questions,
     option_name_for_letter,
@@ -48,6 +49,7 @@ from api.skip_registry import (
     REASON_INLINE_QUIZ,
     REASON_SERVER_REJECT,
     REASON_TEXT,
+    forget_skip,
     record_skip,
     should_skip,
 )
@@ -178,41 +180,35 @@ MAX_FULL_RESTART = 2    # 片尾不认时从头真播的轮数上限(首轮之�
 
 # ===== 视频卡住诊断 =====
 # 「进度推到片尾, 服务端 isPassed 仍是 false」有三种常见原因, 光看日志分不出来:
-#   1. 视频中途有弹窗题(ans-videoquiz)没答 -> 卡片 JSON 里能找到题目
-#   2. 该视频开启了人脸采集(videoFaceCaptureEnc 非空) -> 纯 HTTP 做不到
+#   1. 视频中途有弹窗题(ans-videoquiz)没答 -> 卡片 JSON / initdata 里能找到题目
+#   2. 该视频开启了人脸采集 -> 纯 HTTP 做不到
 #   3. 服务端状态延迟或风控
 # 下面这套东西的作用就是: 卡住时把「是哪种」直接写进日志。
 VIDEO_DEBUG_DIR: Optional[str] = None
 
 
 def has_face_capture(job: dict) -> bool:
-    """这个视频任务点是否开启了人脸采集
+    """这个视频任务点是否**确实**开启了人脸采集
 
-    开了人脸采集的视频, 进度推到片尾服务端也照样不认(isPassed=false), 还会 403。
-    这是纯 HTTP 方案的硬边界 —— 不是重试能解决的问题, 所以要在播放之前就认出来,
-    直接跳过去做本节测验, 而不是把整段视频白播一遍再从头重播一遍。
+    判定口径收得很紧, 因为松过一次: 旧实现只要 `videoFaceCaptureEnc` 非空就返回 True,
+    而实测**很多没有开人脸的视频卡片里同样带着这个字段**(值是 "0"、短占位串, 或与
+    本节课无关的残留), 结果把「视频中间有弹窗题没答」误诊成人脸, 整节视频播前跳过,
+    任务点白白空着。用户核对后发现根本没有要人脸。
 
-    开关出现在两个地方, 都要看:
-      * 任务点卡片 / 列表里的 videoFaceCaptureEnc (非空即开启)
-      * /ananas/status 响应里的 videoFaceCapture / faceCapture
+    现在只认两类证据(实现见 api/video_quiz.py):
+      * 明确的开关字段为真: `videoFaceCapture` / `faceCapture` 取 1 / true;
+      * 加密凭据确实像真密文: 长度 >= 24 且是十六进制/Base64 字符集(形如 701f7179...)。
+
+    真正要跳过的场景还有第二道保险: 卡片里带弹窗题时一律照常播放(见 study_video),
+    因为「刷不过去」更可能是题没答, 而不是人脸。
     """
     if not isinstance(job, dict):
         return False
-    for field in ("videoFaceCaptureEnc", "videoFaceCapture", "faceCaptureEnc"):
-        value = job.get(field)
-        if isinstance(value, str) and value.strip():
-            return True
-        if isinstance(value, dict) and value:
-            return True
-    raw = job.get("raw_card")
-    if isinstance(raw, dict):
-        value = raw.get("videoFaceCaptureEnc")
-        if isinstance(value, str) and value.strip():
-            return True
     try:
-        return bool(summarize_video_card(raw).get("has_face_capture"))
-    except Exception:  # 诊断函数不能反过来把主流程搞挂
+        return detect_face_capture(job, depth=2)
+    except Exception:  # 判定函数不能反过来把主流程搞挂
         return False
+
 
 
 def configure_video_debug(path: Optional[str]) -> None:
@@ -585,6 +581,42 @@ class Chaoxing:
                     self.inline_quiz_stat["total"] += len(quizzes)
                 return quizzes
         return []
+
+    def _peek_inline_quizzes(self, job: dict,
+                             _type: Literal["Video", "Audio"] = "Video") -> list[dict]:
+        """播前预取「这个视频有哪些弹窗题」, 带缓存
+
+        用途是回答一个判断题: 这个任务点刷不过去, 到底是**题没答**还是**要人脸**。
+        有题就一律照常播放, 绝不按人脸跳过 —— 踩过这个坑, 一批「视频中间插一道题」
+        的课程被误诊成人脸, 整节课时白白跳过、任务点空着。
+
+        结果存进 `_inline_quiz_cache`, 真正开播时 `_study_video_once()` 直接复用,
+        不会重复请求接口, 也不会重复答题花钱。
+        """
+        cache = getattr(self, "_inline_quiz_cache", None)
+        if cache is None:
+            cache = {}
+            self._inline_quiz_cache = cache
+        key = str(job.get("jobid") or job.get("objectid") or "")
+        if key in cache:
+            return cache[key]
+
+        quizzes: list[dict] = []
+        try:
+            session = SessionManager.get_session()
+            headers = gc.VIDEO_HEADERS if _type == "Video" else gc.AUDIO_HEADERS
+            quizzes = self._fetch_inline_quizzes(session, job, headers)
+        except Exception as exc:  # 预取只为判断, 失败不能影响播放
+            logger.debug("[视频弹窗题] 播前预取失败: {}", exc)
+        cache[key] = quizzes
+        return quizzes
+
+    def _has_quiz_hint(self, job: dict) -> bool:
+        """卡片里有没有弹窗题的痕迹(接口没下发时的第二重证据)"""
+        try:
+            return bool(find_inline_questions(job.get("raw_card")))
+        except Exception:
+            return False
 
     def _submit_inline_quiz(self, session, quiz: dict, answer: str, headers) -> bool:
         """提交一道弹窗题的答案
@@ -1085,6 +1117,17 @@ class Chaoxing:
         # 1) 上次运行已经确认「重试也没用」(比如人脸采集) -> 本次直接跳过
         known = should_skip("video", _job)
         if known:
+            code = str(known.get("reason_code") or "")
+            # 人脸采集的旧结论要复核: 判定口径改严了, 旧记录很可能就是那个误判
+            if code == REASON_FACE_CAPTURE and not has_face_capture(_job):
+                forget_skip("video", _job)
+                logger.warning(
+                    "[复核] 记录簿说这个视频开了人脸采集, 但按新口径复核不成立(原判定误判), "
+                    "本次照常播放: {}",
+                    _job.get("name"),
+                )
+                known = None
+        if known:
             reason = known.get("reason") or REASON_TEXT.get(REASON_FACE_CAPTURE, "")
             logger.warning(
                 "[跳过] 该任务点上次已判定为无法自动完成, 本次不再尝试: {} | 原因: {}",
@@ -1094,19 +1137,37 @@ class Chaoxing:
                                str(known.get("reason_code") or REASON_FACE_CAPTURE), reason)
             return StudyResult.SKIPPED
 
-        # 2) 人脸采集: 在播放之前就认出来, 别白播一遍再从头重播一遍
+        # 2) 播前先看一眼这个视频有没有「视频内嵌题」。
+        #    这是判断「刷不过去」原因的关键证据: 有题的时候, 服务端不认通过几乎都是
+        #    题没答完, 跟人脸采集没关系 —— 旧判定把这类课程误诊成人脸直接跳过,
+        #    整节视频白丢。所以先拿到证据, 再决定要不要跳过。
+        inline_quizzes = self._peek_inline_quizzes(_job, _type)
+        has_quiz = bool(inline_quizzes) or self._has_quiz_hint(_job)
+
+        # 3) 人脸采集: 认出来就在播放之前跳过, 别白播一遍再从头重播一遍。
+        #
+        #    但**卡片里带弹窗题的视频不跳过**: 有题时「不认通过」的第一嫌疑是题没答,
+        #    正常播一遍、把题答掉, 任务点大概率就过了。跳过了反而永远补不上。
         if getattr(self, "skip_face_capture", True) and has_face_capture(_job):
-            reason = REASON_TEXT.get(REASON_FACE_CAPTURE, "该视频开启人脸采集")
-            logger.warning(
-                "[跳过] 视频开启了人脸采集, 纯 HTTP 无法通过, 不播放也不重播: {} | {}",
-                _job.get("name"), reason,
-            )
-            logger.warning(
-                "[跳过] 该任务点需要你在网页端/App 里本人过人脸; "
-                "本次跳过它继续做本节测验, 下一节照常进行"
-            )
-            self._mark_skipped(course_title, _job, REASON_FACE_CAPTURE, reason)
-            return StudyResult.SKIPPED
+            if has_quiz:
+                logger.warning(
+                    "[人脸] 检测到人脸采集标记, 但这个视频带弹窗题(接口 {} 道 / 卡片命中 {}), "
+                    "「刷不过去」更可能是题没答 —— 本次照常播放并自动答题, 不跳过: {}",
+                    len(inline_quizzes), "是" if self._has_quiz_hint(_job) else "否",
+                    _job.get("name"),
+                )
+            else:
+                reason = REASON_TEXT.get(REASON_FACE_CAPTURE, "该视频开启人脸采集")
+                logger.warning(
+                    "[跳过] 视频开启了人脸采集, 纯 HTTP 无法通过, 不播放也不重播: {} | {}",
+                    _job.get("name"), reason,
+                )
+                logger.warning(
+                    "[跳过] 该任务点需要你在网页端/App 里本人过人脸; "
+                    "本次跳过它继续做本节测验, 下一节照常进行"
+                )
+                self._mark_skipped(course_title, _job, REASON_FACE_CAPTURE, reason)
+                return StudyResult.SKIPPED
 
         self._last_stuck = None
         result, stuck = self._study_video_once(

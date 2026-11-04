@@ -91,6 +91,45 @@ def test_detect_face_capture():
     print("[ok] 能识别出人脸采集")
 
 
+def test_face_capture_needs_real_evidence():
+    """只有「字段非空」不算人脸采集 —— 这是曾经的误判源头
+
+    旧实现: `videoFaceCaptureEnc` 非空就判人脸, 结果把一批「视频中间插了一道题」
+    的课程整节跳过。真实卡片里这个字段经常带着 "0" 之类的占位值。
+    """
+    cases = [
+        ({"videoFaceCaptureEnc": ""}, False, "空串"),
+        ({"videoFaceCaptureEnc": "0"}, False, "字符串 0"),
+        ({"videoFaceCaptureEnc": "abc"}, False, "短占位串"),
+        ({"videoFaceCaptureEnc": "1234567890"}, False, "纯数字短串"),
+        ({"videoFaceCapture": 0}, False, "开关为 0"),
+        ({"videoFaceCapture": "0"}, False, "开关为字符串 0"),
+        ({"videoFaceCapture": 1}, True, "开关为 1"),
+        ({"videoFaceCapture": "1"}, True, "开关为字符串 1"),
+        ({"videoFaceCaptureEnc": "701f717922e30129e914bcec53d18d3f"}, True, "真密文"),
+    ]
+    for fields, expected, note in cases:
+        job = {"jobid": "x", "name": "视频.mp4"}
+        job.update(fields)
+        got = base.has_face_capture(job)
+        assert got is expected, f"{note}: 期望 {expected}, 实际 {got} ({fields})"
+    print("[ok] 人脸判定: 只认明确开关和真密文, 占位值不再误判")
+
+
+def test_face_capture_with_nested_property():
+    """开关也可能放在 property 里"""
+    card = {
+        "jobid": "3",
+        "type": "video",
+        "property": {"name": "v.mp4", "videoFaceCapture": 1},
+    }
+    assert base.has_face_capture({"jobid": "3", "raw_card": card}) is True
+
+    plain = {"jobid": "4", "type": "video", "property": {"name": "v.mp4", "videoFaceCapture": 0}}
+    assert base.has_face_capture({"jobid": "4", "raw_card": plain}) is False
+    print("[ok] 人脸判定: 能读 property 里的开关, 关闭时不误判")
+
+
 def test_question_dedup():
     """同一道题在多个位置出现(容器+具体节点)只保留一份"""
     question = {
@@ -228,6 +267,8 @@ if __name__ == "__main__":
     test_find_questions_in_card()
     test_no_false_positive_on_plain_card()
     test_detect_face_capture()
+    test_face_capture_needs_real_evidence()
+    test_face_capture_with_nested_property()
     test_question_dedup()
     test_judgement_without_options()
     test_parse_quiz_list()
