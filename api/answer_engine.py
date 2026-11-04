@@ -8,12 +8,9 @@
 设计原则:
 1. 只吃 api.decode.decode_questions_info() 解出来的题目结构, 不碰任何网络请求,
    这样任何页面只要能被 decode 解析, 就能用它来作答;
-2.    逐级降级: 人工校订 -> 题库命中 -> 选项字母匹配 -> 相似度兜底 -> 随机兜底,
+2. 逐级降级: 题库命中 -> 选项字母匹配 -> 相似度兜底 -> 随机兜底,
    任何一步失败都不会抛异常打断整个流程;
 3. 统计覆盖率, 由调用方决定「提交」还是「只保存」, 与现有 tiku 提交逻辑保持一致。
-
-人工校订(manual_answers.json)排在最前面: 大模型答错的题, 只要人工钉死了答案,
-无论题库有没有命中、AI 缓存里存的是对是错, 都以人工的为准。
 
 题目结构 (由 decode.py 产出):
     {
@@ -32,7 +29,6 @@ from difflib import SequenceMatcher
 from typing import Any, Optional
 
 from api.logger import logger
-from api.manual_answers import get_default_answer_book, lookup_manual_answer
 
 __all__ = ["SolvedQuestion", "AnswerReport", "AnswerEngine", "build_submit_payload"]
 
@@ -50,26 +46,6 @@ _CHAR_MAP = str.maketrans({
     "⻢": "马",
 })
 
-# 判断题的常见写法。故意不收 "A"/"B": 有的课判断题选项是「A.正确 B.错误」,
-# 也有的课把判断题和选择题混排, 认字母容易把「选 A」误判成「正确」。
-_JUDGE_TRUE = {"正确", "对", "√", "是", "true", "t", "y", "yes", "1"}
-_JUDGE_FALSE = {"错误", "错", "×", "x", "否", "false", "f", "n", "no", "0"}
-
-# 人工答案里「纯字母」形式(A / ABD / A,B,D)的识别
-_LETTERS_ONLY = re.compile(r"^[A-Ha-h]{1,8}$")
-
-
-def _letters_of(items: list[str]) -> str:
-    """把人工写的「A」「ABD」「A,B,D」解析成字母串; 不是纯字母就返回空串"""
-    compact = re.sub(r"[\s,，、;；|/]+", "", "".join(items))
-    if not compact:
-        return ""
-    # 去掉「选A」「答案:B」这类前缀
-    compact = re.sub(r"^(?:答案|选|正确选项)\s*[:：]?", "", compact)
-    if _LETTERS_ONLY.match(compact):
-        return compact.upper()
-    return ""
-
 
 @dataclass
 class SolvedQuestion:
@@ -81,12 +57,7 @@ class SolvedQuestion:
 
     @property
     def is_covered(self) -> bool:
-        """「有依据」的答案: 人工校订 + 题库命中, 都算"""
-        return self.source in ("manual", "tiku")
-
-    @property
-    def is_manual(self) -> bool:
-        return self.source == "manual"
+        return self.source == "tiku"
 
     @property
     def is_ai(self) -> bool:
@@ -118,28 +89,22 @@ class AnswerReport:
         return sum(1 for item in self.solved if item.is_ai)
 
     @property
-    def manual_count(self) -> int:
-        """人工校订命中数"""
-        return sum(1 for item in self.solved if item.is_manual)
-
-    @property
     def review_count(self) -> int:
         """需要人工复核的题数(图片题: 模型只看到图片链接)"""
         return sum(1 for item in self.solved if item.needs_review)
 
     @property
     def cover_rate(self) -> float:
-        """有依据的作答比例(人工校订 + 题库 + 大模型), 0.0 ~ 1.0"""
+        """有依据的作答比例(题库 + 大模型), 0.0 ~ 1.0"""
         if not self.total:
             return 0.0
         return (self.covered + self.ai_count) / self.total
 
     def summary(self) -> str:
         review = f", 图片题 {self.review_count} 题需人工复核" if self.review_count else ""
-        manual = f"(其中人工校订 {self.manual_count} 题)" if self.manual_count else ""
         return (
             f"{self.title or '本次作答'}: 共 {self.total} 题, "
-            f"题库/人工命中 {self.covered} 题{manual}, AI 作答 {self.ai_count} 题, "
+            f"题库命中 {self.covered} 题, AI 作答 {self.ai_count} 题, "
             f"覆盖率 {self.cover_rate * 100:.0f}%, 耗时 {self.elapsed:.1f}s{review}"
         )
 
@@ -167,17 +132,10 @@ class AnswerEngine:
         started = time.time()
         report = AnswerReport(title=title)
 
-        # AI 优先模式: 先把所有题目丢给大模型并发作答, 再逐题回填, 避免串行等待。
-        # 人工校订已命中的题不再问模型 —— 答案已经确定, 问了也是白花钱。
+        # AI 优先模式: 先把所有题目丢给大模型并发作答, 再逐题回填, 避免串行等待
         ai_answers: dict[str, Any] = {}
         if self.ai_mode == "priority" and questions:
-            pending = [q for q in questions if not lookup_manual_answer(q)]
-            if len(pending) < len(questions):
-                logger.info(
-                    f"[人工答案] {len(questions) - len(pending)} 题已有人工答案, 不送大模型"
-                )
-            if pending:
-                ai_answers = self.ai_solver.solve_many(pending)
+            ai_answers = self.ai_solver.solve_many(questions)
 
         for question in questions:
             solved = self.solve_one(question, ai_prefetched=ai_answers.get(question.get("id", "")))
@@ -196,20 +154,17 @@ class AnswerEngine:
         answer = ""
         source = ""
 
-        # 0) 人工校订答案: 优先级最高, 命中就不再问题库/大模型
-        answer, source = self._solve_by_manual(question, q_type, options)
-
-        if not answer and self.ai_mode == "priority":
+        if self.ai_mode == "priority":
             answer, source = self._solve_by_ai(question, ai_prefetched)
             if not answer:
                 answer, source = self._solve_by_tiku(question, q_type, options)
 
-        elif not answer and self.ai_mode == "fallback":
+        elif self.ai_mode == "fallback":
             answer, source = self._solve_by_tiku(question, q_type, options)
             if not answer:
                 answer, source = self._solve_by_ai(question, ai_prefetched)
 
-        elif not answer:
+        else:
             answer, source = self._solve_by_tiku(question, q_type, options)
 
         if not answer:
@@ -232,81 +187,7 @@ class AnswerEngine:
             needs_review=bool(question.get("needs_review")),
         )
 
-    # ------------------------------------------------------------------ 三种答案来源
-    def _solve_by_manual(self, question: dict[str, Any], q_type: str, options: str,
-                         entry: Optional[dict] = None) -> tuple[str, str]:
-        """人工校订答案(manual_answers.json)
-
-        命中就用它, 不再问题库也不再问模型 —— 这是「我已经知道正确答案了」的通道。
-        答案可以用人类写法(正确/错误、A、ABD、选项原文), 这里负责转成超星的提交格式。
-        """
-        if entry is None:
-            try:
-                entry = lookup_manual_answer(question)
-            except Exception as exc:  # 答案本坏了不能拖垮答题
-                logger.warning(f"[人工答案] 查询异常, 本题走题库/大模型: {exc}")
-                return "", ""
-        if not entry:
-            return "", ""
-
-        raw = entry.get("answer")
-        text = self._format_manual_answer(entry.get("type") or q_type, raw, options)
-        if not text:
-            logger.warning(
-                f"[人工答案] 命中但答案无法解析成提交格式, 已忽略: "
-                f"{str(question.get('title', ''))[:30]} -> {raw!r}"
-            )
-            return "", ""
-
-        note = str(entry.get("note") or "").strip()
-        logger.info(
-            f"[人工答案] 命中(优先级最高): {str(question.get('title', ''))[:30]} -> {text}"
-            f"{', 备注: ' + note if note else ''}"
-        )
-        return text, "manual"
-
-    def _format_manual_answer(self, q_type: str, raw: Any, options: str) -> str:
-        """把人工写的答案转成超星提交格式
-
-        判断题 -> "true"/"false"; 选择题 -> "A"/"ABD"; 填空题 -> 原文(多空换行)
-        """
-        if isinstance(raw, (list, tuple)):
-            items = [str(item).strip() for item in raw if str(item).strip()]
-        else:
-            items = [str(raw or "").strip()]
-        items = [item for item in items if item]
-
-        if not items:
-            return ""
-
-        if q_type == "judgement":
-            first = items[0].strip().lower().rstrip("。.")
-            if first in _JUDGE_TRUE:
-                return "true"
-            if first in _JUDGE_FALSE:
-                return "false"
-            return ""
-
-        if q_type in ("single", "multiple"):
-            letters = _letters_of(items)
-            if letters:
-                if q_type == "single":
-                    return letters[0]
-                return "".join(sorted(set(letters)))
-            # 写的是选项原文 -> 复用题库那套「文本对字母」的匹配
-            resolved = "\n".join(items)
-            if q_type == "single":
-                return self._match_single(resolved, options)
-            return self._match_multiple(resolved, options)
-
-        # 填空/简答: 多个空用换行分隔(人工写成 "经济|军事" 也算)
-        if isinstance(raw, (list, tuple)):
-            return "\n".join(items)
-        if q_type == "completion":
-            blanks = [part.strip() for part in re.split(r"[|\n]+", items[0]) if part.strip()]
-            return "\n".join(blanks)
-        return items[0]
-
+    # ------------------------------------------------------------------ 两种答案来源
     def _solve_by_tiku(self, question: dict[str, Any], q_type: str, options: str) -> tuple[str, str]:
         if self._tiku_disabled():
             return "", ""
@@ -546,16 +427,12 @@ class AnswerEngine:
         return self.tiku is None or getattr(self.tiku, "DISABLE", False)
 
     def has_answer_source(self) -> bool:
-        """是否至少有一个能给出答案的来源(人工校订 / 题库 / 大模型)
+        """是否至少有一个能给出答案的来源(题库或大模型)
 
-        都没有时只能随机作答, 对章节测验这种要计入成绩的场景没有意义,
+        两者都没有时只能随机作答, 对章节测验这种要计入成绩的场景没有意义,
         调用方应该直接跳过, 而不是答一串随机答案再提交。
         """
-        if not self._tiku_disabled() or bool(self.ai_solver):
-            return True
-        # 只填了 manual_answers.json、既没题库也没 AI 的情况, 也算有来源
-        book = get_default_answer_book()
-        return bool(book and len(book))
+        return (not self._tiku_disabled()) or bool(self.ai_solver)
 
 
 def build_submit_payload(questions: dict[str, Any], report: AnswerReport) -> dict[str, Any]:
@@ -576,8 +453,8 @@ def build_submit_payload(questions: dict[str, Any], report: AnswerReport) -> dic
         question_id = question["id"]
         answer_field = question.get("answerField", {})
         answer_value = answer_field.get(f"answer{question_id}", "")
-        if not submit_mode and item.source not in {"manual", "tiku", "ai"}:
-            # 保存模式: 人工校订/题库命中/AI 作答都保留, 纯随机答案不写进草稿
+        if not submit_mode and item.source not in {"tiku", "ai"}:
+            # 保存模式: 题库命中和 AI 作答都保留, 纯随机答案不写进草稿
             answer_value = ""
         payload[f"answer{question_id}"] = answer_value
         payload[f"answertype{question_id}"] = answer_field.get(f"answertype{question_id}", "")

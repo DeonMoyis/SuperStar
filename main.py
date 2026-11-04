@@ -31,7 +31,6 @@ from api.live import Live
 from api.live_process import LiveProcessor
 from api.playback import FORCED_SPEED, normalize_speed, playback_gate
 from api.runtime_budget import runtime_budget
-from api.manual_answers import DEFAULT_ANSWERS_FILE, configure_default_answer_book
 from api.skip_registry import (
     DEFAULT_REGISTRY_FILE,
     configure_default_registry,
@@ -149,15 +148,6 @@ def parse_args():
         "--skip-registry", type=str, default=None,
         help=f"任务点跳过记录簿路径(默认 {DEFAULT_REGISTRY_FILE}), 下次运行据此直接跳过做不过去的任务点"
     )
-    # 人工校订答案: 把 AI 答错的题钉死正确答案, 优先级最高, 跟着仓库走
-    parser.add_argument(
-        "--answers-file", type=str, default=None,
-        help=f"人工校订答案文件(默认 {DEFAULT_ANSWERS_FILE}); 命中的题不再问题库/大模型"
-    )
-    parser.add_argument(
-        "--manual-answers", dest="manual_answers", action=argparse.BooleanOptionalAction, default=None,
-        help="是否使用人工校订答案(默认开); --no-manual-answers 可临时忽略该文件"
-    )
     # 考试开关: 考试通常是「学完一定进度才解锁」的, 要不要考交给你决定。
     # 不传时跟随配置文件 [answer] exam 的值, 而默认值是「不考」。
     parser.add_argument(
@@ -233,9 +223,6 @@ def load_config_from_file(config_path):
             common_config["skip_face_capture"] = str_to_bool(common_config["skip_face_capture"])
         if "skip_registry" in common_config:
             common_config["skip_registry"] = str_to_bool(common_config["skip_registry"])
-        # 人工校订答案默认启用, 配置文件里写 False 也能关掉
-        if "manual_answers" in common_config:
-            common_config["manual_answers"] = str_to_bool(common_config["manual_answers"])
 
     # 检查并读取tiku节
     if config.has_section("tiku"):
@@ -306,9 +293,6 @@ def build_config_from_args(args):
         else bool(args.skip_face_capture),
         "skip_registry": True,
         "skip_registry_path": getattr(args, "skip_registry", None) or DEFAULT_REGISTRY_FILE,
-        "manual_answers": True if getattr(args, "manual_answers", None) is None
-        else bool(args.manual_answers),
-        "manual_answers_path": getattr(args, "answers_file", None) or DEFAULT_ANSWERS_FILE,
         "ai": ai_config,
     }
     return common_config, {}, {}
@@ -364,16 +348,6 @@ def init_config():
         if getattr(args, "skip_face_capture", None) is not None:
             common_config["skip_face_capture"] = bool(args.skip_face_capture)
         common_config.setdefault("skip_face_capture", True)
-
-        # 人工校订答案(manual_answers.json): 配置或命令行都可以指定别的路径
-        common_config["manual_answers_path"] = (
-            getattr(args, "answers_file", None)
-            or common_config.get("manual_answers_file")
-            or DEFAULT_ANSWERS_FILE
-        )
-        if getattr(args, "manual_answers", None) is not None:
-            common_config["manual_answers"] = bool(args.manual_answers)
-        common_config.setdefault("manual_answers", True)
         return common_config, tiku_config, notification_config
     else:
         return build_config_from_args(args)
@@ -914,20 +888,6 @@ def main():
                 "[跳过记录] 使用 {}: 已有 {} 条记录, 其中 {} 条不会再重试",
                 registry.path, registry.stats()["total"], registry.stats()["permanent"],
             )
-
-        # 人工校订答案: AI 答错的题在这里钉死, 优先级高于题库与大模型。
-        # 文件不存在时什么都不做(不配也能跑), 存在则每次运行都加载。
-        answers_path = common_config.get("manual_answers_path") or DEFAULT_ANSWERS_FILE
-        answer_book = configure_default_answer_book(
-            answers_path, enabled=bool(common_config.get("manual_answers", True))
-        )
-        if answer_book is not None and len(answer_book):
-            logger.info(
-                "[人工答案] 使用 {}: {} 条人工校订答案, 命中即用, 不再问题库/大模型",
-                answer_book.path, len(answer_book),
-            )
-        elif answer_book is not None and os.path.isfile(answers_path):
-            logger.info("[人工答案] {} 是空的, 本次全部走题库/大模型", answers_path)
 
         # 初始化 DeepSeek(没填 api_key 会自动关闭, 不影响其余功能)
         ai_config = normalize_ai_config(common_config.get("ai"))
