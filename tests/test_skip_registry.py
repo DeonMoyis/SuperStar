@@ -54,7 +54,7 @@ class FakeResponse:
 class FakeSession:
     def get(self, url, **kwargs):
         return FakeResponse({
-            "status": "success", "duration": 10, "dtoken": "d",
+            "status": "success", "duration": 3, "dtoken": "d",
             "crc": "c", "key": "k",
         })
 
@@ -70,9 +70,10 @@ def make_chaoxing():
     calls = []
 
     def fake_progress_log(*args, **kwargs):
-        # 开播前那次"是否已完成"探测直接放行, 免得测试真等视频时长
+        # 播到片尾就放行, 免得测试真等视频时长 + 多轮重播
         calls.append(kwargs)
-        return (kwargs.get("_isdrag") == 4, 200)
+        playing = args[6] if len(args) > 6 else kwargs.get("_playingTime", 0)
+        return (int(playing) >= 3, 200)
 
     chaoxing.video_progress_log = fake_progress_log
     return chaoxing, calls
