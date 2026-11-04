@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import functools
+import os
 import random
 import re
 import threading
@@ -27,6 +28,11 @@ from api.decode import (
     decode_course_card,
     decode_course_folder,
     decode_questions_info,
+)
+from api.video_quiz import (
+    dump_json,
+    find_inline_questions,
+    summarize_video_card,
 )
 from api.exceptions import MaxRetryExceeded
 from api.playback import FORCED_SPEED, answer_gate, playback_gate, format_duration
@@ -154,6 +160,39 @@ class StudyResult(Enum):
 STUCK_END_RETRY = 3     # 片尾仍不通过时, 额外重试几次
 STALL_LIMIT = 3         # 连续多少次上报进度都没前进就判定卡死
 
+# ===== 视频卡住诊断 =====
+# 「进度推到片尾, 服务端 isPassed 仍是 false」有三种常见原因, 光看日志分不出来:
+#   1. 视频中途有弹窗题(ans-videoquiz)没答 -> 卡片 JSON 里能找到题目
+#   2. 该视频开启了人脸采集(videoFaceCaptureEnc 非空) -> 纯 HTTP 做不到
+#   3. 服务端状态延迟或风控
+# 下面这套东西的作用就是: 卡住时把「是哪种」直接写进日志。
+VIDEO_DEBUG_DIR: Optional[str] = None
+
+
+def configure_video_debug(path: Optional[str]) -> None:
+    """开启视频诊断数据落盘(目录), 传 None 关闭"""
+    global VIDEO_DEBUG_DIR
+    VIDEO_DEBUG_DIR = path or None
+    if VIDEO_DEBUG_DIR:
+        os.makedirs(VIDEO_DEBUG_DIR, exist_ok=True)
+        logger.info("[视频诊断] 原始诊断数据将保存到 {}", VIDEO_DEBUG_DIR)
+
+
+def save_video_debug(name: str, data) -> Optional[str]:
+    """把诊断数据写成文件, 未开启诊断时什么都不做"""
+    if not VIDEO_DEBUG_DIR:
+        return None
+    safe = re.sub(r"[^\w\u4e00-\u9fa5.-]+", "_", str(name))[:80] or "item"
+    path = os.path.join(VIDEO_DEBUG_DIR, safe)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(data if isinstance(data, str) else dump_json(data))
+    except OSError as exc:
+        logger.debug("[视频诊断] 写文件失败 {}: {}", path, exc)
+        return None
+    return path
+
 
 class SignType(IntEnum):
     NORMAL = 0
@@ -188,6 +227,13 @@ class Chaoxing:
         )
         # 提交策略(auto/always/never + min_cover_rate), 与作业/考试共用同一份配置
         self.answer_policy = kwargs.get("answer_policy") or {}
+        # 卡住的任务点(进度到片尾但服务端不认通过), 结束时统一汇总给用户
+        self.stuck_points: list[dict] = []
+        self._lock_stuck = threading.Lock()
+        # 最近一次视频进度上报的响应体, 卡住时用来诊断
+        self._last_video_resp: Optional[str] = None
+        # 已经作答过的视频弹窗题(按题干/id 去重, 同一道题不重复烧钱)
+        self._inline_seen: set[str] = set()
 
     def login(self, login_with_cookies=False):
         if login_with_cookies:
@@ -435,6 +481,121 @@ class Chaoxing:
             f"[{clazzId}][{userid}][{jobid}][{objectId}][{playingTime * 1000}][d_yHJ!$pdA~5][{duration * 1000}][0_{duration}]"
             .encode()).hexdigest()
 
+    # ------------------------------------------------------------- 视频卡住诊断
+    def _capture_inline_questions(self, data) -> list[dict]:
+        """进度上报的响应里若带「视频内嵌题」, 就地作答并记录下来
+
+        超星在需要弹题的播放位置, 会在 /multimedia/log 的响应里带上题目;
+        这个弹窗不答, 视频会停在原地, 服务端也不会把任务点判为通过 ——
+        现象就是「进度到片尾了, isPassed 还是 false」。
+
+        这里只负责识别 + 作答 + 留证据, 不去盲猜提交接口(猜错会污染账号状态)。
+        """
+        try:
+            questions = find_inline_questions(data)
+        except Exception as exc:  # 结构千奇百怪, 不能让它把播放流程带崩
+            logger.debug("[视频弹窗题] 解析失败: {}", exc)
+            return []
+
+        fresh = []
+        seen = getattr(self, "_inline_seen", None)
+        if seen is None:
+            seen = set()
+            self._inline_seen = seen
+        for q in questions:
+            key = q.get("id") or (q.get("title") or "")[:80]
+            if key and key not in seen:
+                seen.add(key)
+                fresh.append(q)
+        if not fresh:
+            return []
+
+        logger.warning("[视频弹窗题] 进度响应里出现 {} 道视频内嵌题, 正在作答", len(fresh))
+        report_summary = ""
+        try:
+            report = self.answer_engine.solve_all(fresh, title="视频弹窗题")
+            report_summary = report.summary()
+        except Exception as exc:
+            logger.error("[视频弹窗题] 作答失败: {}: {}", type(exc).__name__, exc)
+
+        answers = []
+        for q in fresh:
+            qid = q.get("id") or ""
+            answers.append({
+                "id": qid,
+                "title": q.get("title"),
+                "type": q.get("type"),
+                "answer": (q.get("answerField") or {}).get(f"answer{qid}", ""),
+            })
+        logger.warning("[视频弹窗题] 题目与答案: {}", answers)
+        save_video_debug(
+            f"inline_quiz_{int(time.time())}.json",
+            {"report": report_summary, "answers": answers, "raw": data},
+        )
+        return fresh
+
+    def _diagnose_stuck_video(self, job: dict, status_json: Optional[dict] = None,
+                              reason: str = "") -> dict:
+        """把「这个视频为什么刷不过去」写进日志
+
+        光看 isPassed=false 分不清是弹窗题、人脸采集还是风控。这里把三方面证据
+        (卡片里有没有题目 / status 里有没有人脸采集 / 最近一次上报的响应) 一起打出来。
+        """
+        try:
+            summary = summarize_video_card(job.get("raw_card"))
+        except Exception as exc:
+            summary = {"ok": False, "reason": f"诊断失败: {exc}"}
+
+        status_info = {}
+        if isinstance(status_json, dict):
+            status_info = {
+                k: status_json[k]
+                for k in ("status", "duration", "dtoken", "crc", "key",
+                          "videoFaceCapture", "faceCapture", "question", "questions")
+                if k in status_json
+            }
+
+        last_resp = getattr(self, "_last_video_resp", None) or ""
+        diag = {
+            "任务点": job.get("name"),
+            "jobid": job.get("jobid"),
+            "objectid": job.get("objectid"),
+            "判定原因": reason,
+            "卡片诊断": summary,
+            "status 关键字段": status_info,
+            "最近一次上报响应": last_resp[:1500],
+        }
+
+        logger.error("[视频诊断] {} -> {}", job.get("name"), summary.get("reason"))
+        if summary.get("question_count"):
+            logger.error("[视频诊断] 卡片里发现 {} 道弹窗题, 题目预览: {}",
+                         summary["question_count"],
+                         [q.get("title", "")[:40] for q in summary.get("questions", [])[:3]])
+        if summary.get("has_face_capture"):
+            logger.error("[视频诊断] 该视频开启了人脸采集(videoFaceCaptureEnc 非空), "
+                         "纯 HTTP 方案无法完成, 需要在网页端/App 里过人脸")
+        if last_resp:
+            logger.error("[视频诊断] 最近一次上报响应: {}", last_resp[:600])
+
+        save_video_debug(f"stuck_{job.get('jobid') or 'unknown'}.json", diag)
+        lock = getattr(self, "_lock_stuck", None)
+        points = getattr(self, "stuck_points", None)
+        if points is None:
+            points = []
+            self.stuck_points = points
+        record = {
+            "name": job.get("name"),
+            "reason": summary.get("reason"),
+            "has_face_capture": summary.get("has_face_capture", False),
+            "question_count": summary.get("question_count", 0),
+        }
+        if lock is not None:
+            with lock:
+                points.append(record)
+        else:
+            points.append(record)
+        return diag
+
     def video_progress_log(
             self,
             _session,
@@ -515,7 +676,10 @@ class Chaoxing:
                 resp = _session.get(_url, params=params, headers=headers)
                 if resp.status_code == 200:
                     logger.trace(resp.text)
-                    return resp.json()["isPassed"], 200
+                    self._last_video_resp = resp.text
+                    data = resp.json()
+                    self._capture_inline_questions(data)
+                    return data["isPassed"], 200
                 # elif resp.ok:
                 #    # TODO: 处理验证码
                 #    pass
@@ -531,7 +695,10 @@ class Chaoxing:
 
         if resp.status_code == 200:
             logger.trace(resp.text)
-            return resp.json()["isPassed"], 200
+            self._last_video_resp = resp.text
+            data = resp.json()
+            self._capture_inline_questions(data)
+            return data["isPassed"], 200
 
         elif resp.status_code == 403:
             logger.debug(
@@ -648,10 +815,10 @@ class Chaoxing:
                     break
             logger.error(
                 "任务点进度已到片尾但仍未通过: {} (已进行 {} / 总时长 {})。"
-                "常见原因是还有弹窗题/章节测验未做, 建议到网页端手动确认。"
                 "本次跳过该任务点, 不再空转。",
                 _job['name'], format_duration(play_time), format_duration(duration),
             )
+            self._diagnose_stuck_video(_job, _video_info, "进度到片尾但服务端不认通过")
             return StudyResult.SKIPPED
 
         # 倍速统一由 api/playback.py 钉死为 1.0, 外部传入的 _speed 一律忽略
@@ -723,9 +890,13 @@ class Chaoxing:
                                 if stall_count >= STALL_LIMIT:
                                     logger.error(
                                         "任务点连续 {} 次上报进度都没有前进, 判定卡死: {} "
-                                        "(进度 {} / 总时长 {})。本次跳过, 建议到网页端检查是否需要先完成弹窗题。",
+                                        "(进度 {} / 总时长 {})。本次跳过。",
                                         stall_count, _job['name'],
                                         format_duration(play_time), format_duration(duration),
+                                    )
+                                    self._diagnose_stuck_video(
+                                        _job, _video_info,
+                                        f"连续 {stall_count} 次上报进度无变化",
                                     )
                                     return StudyResult.SKIPPED
 

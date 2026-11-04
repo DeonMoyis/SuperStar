@@ -61,10 +61,17 @@ jobs:
           #   留空 / true -> 考试也自动做
           #   false       -> 跳过考试, 只做作业(考试有次数限制, 想自己考就设 false)
           ANSWER_EXAM: ${{ vars.ANSWER_EXAM }}
-          # 可选: 作业和刷课谁先做 (before / after / both), 默认 before
-          #   before -> 先做作业再刷视频, 视频刷不完也不会漏作业
-          #   both   -> 刷课前后各扫一遍, 能补上刷课过程中才解锁的作业
+          # 可选: 作业和刷课谁先做 (after / before / both), 默认 after
+          #   after  -> 先刷课, 刷完这门再做作业/考试
+          #   before -> 先做作业再刷视频
+          #   both   -> 刷课前后各扫一遍
           ANSWER_ORDER: ${{ vars.ANSWER_ORDER }}
+          # 可选: 设 true 时, 刷不过去的视频会把卡片/状态/上报响应存到 video_debug/
+          #   用来区分「弹窗题 / 人脸采集 / 风控」, 排查完记得关掉
+          VIDEO_DEBUG: ${{ vars.VIDEO_DEBUG }}
+          # 可选: 设 true 时 AI 答题开启深度思考(需要推导的题更准, 但更慢更贵, 会多耗 token)
+          #   留空 / false -> 不思考, 快且省
+          AI_THINKING: ${{ vars.AI_THINKING }}
           # 单次运行时长上限(分钟):
           #   手动触发时填的值 > 仓库 Variables 里的 MAX_RUNTIME_MINUTES > 默认 110
           MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime || vars.MAX_RUNTIME_MINUTES || '110' }}
@@ -83,6 +90,11 @@ jobs:
             args+=(--auto-answer)
             if [ -n "$DEEPSEEK_API_KEY" ]; then
               args+=(--deepseek-key "$DEEPSEEK_API_KEY")
+            fi
+            # 深度思考开关: 只有明确设成 true/1 才开
+            if [ "$AI_THINKING" = "true" ] || [ "$AI_THINKING" = "1" ]; then
+              args+=(--ai-thinking)
+              echo "本次 AI 答题开启深度思考"
             fi
             if [ -n "$ANSWER_SUBMIT" ]; then
               args+=(--answer-submit "$ANSWER_SUBMIT")
@@ -105,4 +117,11 @@ jobs:
           # 到点后程序自己收尾退出, 正在播的视频会播完
           args+=(--max-runtime "$MAX_RUNTIME_MINUTES")
           echo "本次运行时长上限: ${MAX_RUNTIME_MINUTES} 分钟"
+
+          # 视频诊断: 排查「刷不过去」时打开, 诊断数据会存到 video_debug/
+          if [ "$VIDEO_DEBUG" = "true" ]; then
+            args+=(--video-debug)
+            echo "已开启视频诊断, 诊断数据将保存到 video_debug/"
+          fi
+
           python main.py "${args[@]}"

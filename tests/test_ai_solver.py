@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from api.ai_solver import AIConfig, AISolver, normalize_ai_config
+from api.ai_solver import AICache, AIConfig, AISolver, normalize_ai_config
 from api.answer_engine import AnswerEngine
 
 
@@ -205,7 +205,86 @@ def test_config():
     config = normalize_ai_config({"api_key": "sk-1234567890abcd", "concurrency": "99", "temperature": "5"})
     assert config.concurrency == 16 and config.temperature == 2.0
     assert config.masked_key().startswith("sk-123") and "***" in config.masked_key()
-    print("[ok] 配置归一化: 缺 key 自动关闭, 非法值回退")
+    # 开深度思考时 max_tokens 必须自动抬高, 否则思考会吃光配额
+    thinking = normalize_ai_config({"api_key": "sk-1", "thinking": "true", "max_tokens": "1024"})
+    assert thinking.thinking is True and thinking.max_tokens == 4096, thinking.max_tokens
+    # 用户自己填了更大的值就不动
+    big = normalize_ai_config({"api_key": "sk-1", "thinking": "true", "max_tokens": "8192"})
+    assert big.max_tokens == 8192
+    print("[ok] 配置归一化: 缺 key 自动关闭, 非法值回退, 开思考自动抬 max_tokens")
+
+
+def test_thinking_request():
+    """开思考时不注入 disabled, 且 thinking 直接留在 extra_body 之外"""
+    solver, calls = make_solver(['{"answer": ["B"], "confidence": 0.9}'], thinking=True)
+    answer = solver.solve(q())
+    assert answer and answer.answer == ["B"]
+    kwargs = calls.calls[0]
+    assert "extra_body" not in kwargs, "开思考时不应该再发 disabled"
+    assert kwargs["max_tokens"] >= 4096, "开思考后输出配额应被抬高"
+    print("[ok] 深度思考: 不注入 disabled, max_tokens 抬到 4096")
+
+
+def test_thinking_json_400_fallback():
+    """思考模式 + JSON 输出被端点拒绝(400)时, 去掉 response_format 再问一次"""
+    error = Exception("response_format is not supported with thinking")
+    error.status_code = 400
+    solver, calls = make_solver(
+        [error, '{"analysis": "先推理", "answer": ["B"], "confidence": 0.9}'],
+        thinking=True, max_retries=3,
+    )
+    answer = solver.solve(q())
+    assert answer and answer.answer == ["B"], answer
+    assert len(calls.calls) == 2
+    assert "response_format" not in calls.calls[1], "第二次应改为纯文本输出"
+    print("[ok] 思考模式不支持 JSON 时自动降级为文本解析")
+
+
+def test_image_question_marked():
+    """题干里有 <img> 时, 标记 has_image 并在提示里说明模型看不到图"""
+    solver, calls = make_solver(['{"analysis": "看图", "answer": ["A"], "confidence": 0.6}'])
+    answer = solver.solve(q(title='根据下图回答问题 <img src="https://x/1.png">'))
+    assert answer and answer.has_image is True
+    user_msg = calls.calls[0]["messages"][1]["content"]
+    assert "图片" in user_msg and "confidence" in user_msg
+    assert solver.image_questions == 1
+    print("[ok] 图片题被标记, 提示词里说明看不到图")
+
+
+def test_engine_marks_review():
+    solver, _ = make_solver(['{"answer": ["A"], "confidence": 0.8}'])
+    engine = AnswerEngine(SimpleNamespace(DISABLE=True), ai_solver=solver, ai_mode="fallback")
+    question = q("9", '下图是什么 <img src="https://x/2.png">', "single", "A.1\nB.2")
+    report = engine.solve_all([question], title="图片题")
+    assert report.review_count == 1
+    assert report.solved[0].needs_review is True
+    assert "人工复核" in report.summary()
+    print("[ok] 引擎汇总:", report.summary())
+
+
+def test_cache_namespace_and_confidence():
+    """缓存 key 跟模型/版本走; 低置信度的猜测不落缓存"""
+    path = "ai_cache_test.json"
+    for leftover in (path, path + ".tmp"):
+        if os.path.isfile(leftover):
+            os.remove(leftover)
+    try:
+        item = q()
+        assert AICache(path, "deepseek-flash").make_key(item) != AICache(path, "deepseek-reasoner").make_key(item), \
+            "换模型必须换缓存 key"
+
+        config = AIConfig(api_key="sk-test", cache=True, cache_file=path)
+        completions = FakeCompletions(['{"answer": ["B"], "confidence": 0.2}'] * 3)
+        solver = AISolver(config, client=SimpleNamespace(chat=SimpleNamespace(completions=completions)))
+        solver.solve(item)
+        assert len(solver._cache) == 0, "低置信度答案不该写缓存"
+        solver.solve(item)
+        assert len(completions.calls) == 2, "没缓存就应该重新请求"
+        print("[ok] 缓存: key 带模型/版本, 低置信度不落盘")
+    finally:
+        for leftover in (path, path + ".tmp"):
+            if os.path.isfile(leftover):
+                os.remove(leftover)
 
 
 def main():
@@ -221,6 +300,11 @@ def main():
     test_engine_with_ai_only()
     test_engine_fallback_order()
     test_config()
+    test_thinking_request()
+    test_thinking_json_400_fallback()
+    test_image_question_marked()
+    test_engine_marks_review()
+    test_cache_namespace_and_confidence()
     print("\nAI 答题离线自测全部通过")
 
 

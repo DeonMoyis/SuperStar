@@ -53,6 +53,7 @@ class SolvedQuestion:
     question: dict[str, Any]
     answer: str
     source: str  # tiku(题库命中) / ai(大模型作答) / random(随机兜底) / empty(无法作答)
+    needs_review: bool = False  # 题目依赖图片, 模型看不到图, 答案建议人工复核
 
     @property
     def is_covered(self) -> bool:
@@ -88,6 +89,11 @@ class AnswerReport:
         return sum(1 for item in self.solved if item.is_ai)
 
     @property
+    def review_count(self) -> int:
+        """需要人工复核的题数(图片题: 模型只看到图片链接)"""
+        return sum(1 for item in self.solved if item.needs_review)
+
+    @property
     def cover_rate(self) -> float:
         """有依据的作答比例(题库 + 大模型), 0.0 ~ 1.0"""
         if not self.total:
@@ -95,10 +101,11 @@ class AnswerReport:
         return (self.covered + self.ai_count) / self.total
 
     def summary(self) -> str:
+        review = f", 图片题 {self.review_count} 题需人工复核" if self.review_count else ""
         return (
             f"{self.title or '本次作答'}: 共 {self.total} 题, "
             f"题库命中 {self.covered} 题, AI 作答 {self.ai_count} 题, "
-            f"覆盖率 {self.cover_rate * 100:.0f}%, 耗时 {self.elapsed:.1f}s"
+            f"覆盖率 {self.cover_rate * 100:.0f}%, 耗时 {self.elapsed:.1f}s{review}"
         )
 
 
@@ -173,7 +180,12 @@ class AnswerEngine:
         answer_field[f"answer{question_id}"] = answer
         question[f"answer_source{question_id}"] = source
         logger.info(f'{question.get("title", "")} 填写答案为 {answer or "<空>"} (来源: {source})')
-        return SolvedQuestion(question=question, answer=answer, source=source)
+        return SolvedQuestion(
+            question=question,
+            answer=answer,
+            source=source,
+            needs_review=bool(question.get("needs_review")),
+        )
 
     # ------------------------------------------------------------------ 两种答案来源
     def _solve_by_tiku(self, question: dict[str, Any], q_type: str, options: str) -> tuple[str, str]:
@@ -211,6 +223,10 @@ class AnswerEngine:
         if not text:
             logger.warning("[AI] 答案为空, 放弃使用")
             return "", ""
+        if getattr(ai_answer, "has_image", False):
+            # 图片题: 模型只看得到图片链接, 答案只能算推测, 标记出来供收尾汇总
+            question["needs_review"] = True
+            logger.warning(f"[AI] 图片题答案仅供参考, 建议人工复核: {question.get('title', '')[:40]}")
         logger.info(
             f"[AI] 作答: {text} (置信度 {ai_answer.confidence:.2f}"
             f"{', 缓存' if ai_answer.from_cache else ''}{', 纠错过' if ai_answer.repaired else ''}"

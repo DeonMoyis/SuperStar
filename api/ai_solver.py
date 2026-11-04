@@ -38,11 +38,26 @@ __all__ = [
     "configure_default_solver",
     "get_default_solver",
     "release_default_solver",
+    "question_has_image",
 ]
 
 DEFAULT_MODEL = "deepseek-flash"          # DeepSeek-V4.1-Flash-1017
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_CACHE_FILE = "ai_cache.json"
+
+# 缓存版本号: 提示词或校验逻辑一改就 +1, 让旧缓存自动失效
+# (否则前一天答错的答案会被永久缓存, 改了提示词也还是错)
+CACHE_VERSION = "v2"
+
+# 开深度思考后, 思考过程也要占输出配额, 1024 很容易被吃掉导致 content 为空,
+# 所以打开 thinking 时把上限抬到这个值(用户显式填了更大的值则不动)
+THINKING_MIN_TOKENS = 4096
+
+# 置信度低于这个值的答案不写缓存: 大概率是猜的, 留着只会污染后续运行
+CACHE_MIN_CONFIDENCE = 0.5
+
+# 题干/选项里出现这些标记, 说明题目依赖图片, 而模型只能看到一串 URL
+IMAGE_MARKERS = re.compile(r"<img\b|\[图片\]|!\[", re.IGNORECASE)
 
 # 题型中文名, 只用于提示词
 TYPE_CN = {
@@ -58,19 +73,34 @@ SYSTEM_PROMPT = """你是一个严谨的网课答题助手，需要根据题目�
 
 严格遵守以下规则：
 1. 只输出一个 JSON 对象，不要输出 markdown 代码块、不要输出任何解释性段落。
-2. 单选题：answer 里只放一个选项字母，例如 ["B"]。
-3. 多选题：answer 里放所有正确选项的字母，按字母升序，例如 ["A", "C", "D"]；不确定时也要选出至少两个。
-4. 判断题：answer 里只放 "正确" 或 "错误"。
-5. 填空题：按空的先后顺序，每个空一个元素；一空多答案用 "@@" 分隔，例如 ["光合作用", "叶绿体"]。
-6. 简答题：answer 里放一段可直接提交的中文答案，控制在 200 字以内。
-7. 选择题一律回答选项字母，不要输出选项内容；不要假设选项一定从 A 开始。
-8. confidence 表示你对该答案的把握，取值 0 到 1；reason 用不超过 20 字说明依据。
+2. 先在 analysis 里做推理（不超过 100 字：关键依据、为什么排除其他选项），把它写在 answer 前面，再给答案。
+3. 单选题：answer 里只放一个选项字母，例如 ["B"]。
+4. 多选题：answer 里放所有**有依据**的选项字母，按字母升序，例如 ["A", "C", "D"]。
+   只选你能说出理由的选项；不要为了凑数硬加，宁可少选也不要多选无关项（多选错一个通常整题判错）。
+5. 判断题：answer 里只放 "正确" 或 "错误"。
+6. 填空题：按空的先后顺序，每个空一个元素；一空多答案用 "@@" 分隔，例如 ["光合作用", "叶绿体"]。
+7. 简答题：answer 里放一段可直接提交的中文答案，控制在 200 字以内。
+8. 选择题一律回答选项字母，不要输出选项内容；不要假设选项一定从 A 开始。
+9. confidence 表示你对该答案的把握，取值 0 到 1；reason 用不超过 20 字说明依据。
+10. 如果题目信息不全（题干里有你看不到的图片、缺少条件、选项被截断），就如实把 confidence 调低，
+    不要凭空编造题干没有的条件。
 
 输出格式示例：
-{"answer": ["B"], "confidence": 0.93, "reason": "动量守恒定律"}"""
+{"analysis": "由 v=at 得 t=v/a=2s，故选 B", "answer": ["B"], "confidence": 0.93, "reason": "运动学公式"}"""
 
 REPAIR_PROMPT = """你上一次的回答不符合要求：{problem}。
 本题的有效选项只有 {letters}，请重新作答，只输出 JSON 对象，answer 中的字母必须来自 {letters}。"""
+
+
+def question_has_image(q_info: dict[str, Any]) -> bool:
+    """题目是否依赖图片
+
+    decode.py 把题干里的 <img> 转成了 `<img src="...">` 这种纯文本,
+    模型看到的只是一串 URL, 图里的图形/公式/表格它完全看不到。
+    这种题的答案只能算推测, 需要标记出来让人工复核。
+    """
+    text = f"{q_info.get('title') or ''}\n{q_info.get('options') or ''}"
+    return bool(IMAGE_MARKERS.search(text))
 
 
 # ------------------------------------------------------------------ 配置
@@ -87,7 +117,7 @@ class AIConfig:
     max_retries: int = 3
     min_interval_seconds: float = 0.0
     concurrency: int = 4
-    thinking: bool = False          # 答题场景不需要深度思考, 默认关掉, 更快更省
+    thinking: bool = False          # 深度思考; 需要推导的题打开更准, 但慢且贵 (max_tokens 会自动抬高)
     cache: bool = True
     cache_file: str = DEFAULT_CACHE_FILE
     mode: str = "fallback"          # fallback-题库优先 / priority-AI优先 / off-关闭
@@ -96,6 +126,12 @@ class AIConfig:
     @property
     def enabled(self) -> bool:
         return self.mode != "off" and bool(self.api_key.strip())
+
+    def __post_init__(self):
+        # 直接构造 AIConfig(thinking=True) 时也要保证配额够用,
+        # 否则思考 token 会把 1024 的输出配额吃光, content 变成空
+        if self.thinking and self.max_tokens < THINKING_MIN_TOKENS:
+            self.max_tokens = THINKING_MIN_TOKENS
 
     def masked_key(self) -> str:
         key = self.api_key.strip()
@@ -146,6 +182,12 @@ def normalize_ai_config(raw: Optional[dict[str, Any]]) -> AIConfig:
     config.min_interval_seconds = max(0.0, as_float(get("min_interval_seconds", default="0"), 0.0))
     config.concurrency = min(16, max(1, as_int(get("concurrency", default="4"), 4)))
     config.thinking = as_bool(get("thinking", default="false"), False)
+    if config.thinking and config.max_tokens < THINKING_MIN_TOKENS:
+        # 思考 token 也算在输出配额里, 1024 会被思考吃光, 导致返回空内容
+        logger.info(
+            f"[AI] 已开启深度思考, max_tokens 由 {config.max_tokens} 自动提升到 {THINKING_MIN_TOKENS}"
+        )
+        config.max_tokens = THINKING_MIN_TOKENS
     config.cache = as_bool(get("cache", default="true"), True)
     config.cache_file = get("cache_file", default=DEFAULT_CACHE_FILE) or DEFAULT_CACHE_FILE
     config.check_connection = as_bool(get("check_connection", default="true"), True)
@@ -172,6 +214,7 @@ class AIAnswer:
     reason: str = ""
     from_cache: bool = False
     repaired: bool = False
+    has_image: bool = False   # 题目依赖图片, 模型看不到图, 答案只能算推测
     raw: str = ""
 
     @property
@@ -184,10 +227,15 @@ class AIAnswer:
 # ------------------------------------------------------------------ 缓存
 
 class AICache:
-    """答案缓存, 同一道题不重复问模型 (线程安全, 落盘可复用)"""
+    """答案缓存, 同一道题不重复问模型 (线程安全, 落盘可复用)
 
-    def __init__(self, path: str = DEFAULT_CACHE_FILE):
+    namespace 用来隔离「不同模型」的答案: key 里带 model + CACHE_VERSION,
+    换模型或改提示词后旧答案自动失效, 不会被历史错误答案拖累。
+    """
+
+    def __init__(self, path: str = DEFAULT_CACHE_FILE, namespace: str = ""):
         self.path = path
+        self.namespace = namespace
         self._lock = threading.RLock()
         self._data: dict[str, dict[str, Any]] = {}
         self._dirty = 0
@@ -205,9 +253,10 @@ class AICache:
             logger.warning(f"[AI] 缓存文件读取失败, 将从空缓存开始: {exc}")
             self._data = {}
 
-    @staticmethod
-    def make_key(q_info: dict[str, Any]) -> str:
+    def make_key(self, q_info: dict[str, Any]) -> str:
         raw = "|".join([
+            CACHE_VERSION,
+            self.namespace,
             str(q_info.get("type", "")),
             re.sub(r"\s+", "", str(q_info.get("title", ""))),
             re.sub(r"\s+", "", str(q_info.get("options", ""))),
@@ -268,7 +317,10 @@ class AISolver:
         self._client_lock = threading.Lock()
         self._rate_lock = threading.Lock()
         self._last_request_at = 0.0
-        self._cache = AICache(self.config.cache_file) if self.config.cache else None
+        self._cache = (
+            AICache(self.config.cache_file, namespace=self.config.model)
+            if self.config.cache else None
+        )
 
         # 运行统计
         self._stat_lock = threading.Lock()
@@ -276,6 +328,7 @@ class AISolver:
         self.failures = 0
         self.repairs = 0
         self.cache_hits = 0
+        self.image_questions = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
 
@@ -289,20 +342,31 @@ class AISolver:
         if not self.available:
             return None
 
+        has_image = question_has_image(q_info)
+
         # 注意: 不能用 `if self._cache:` —— AICache 定义了 __len__,
         # 空缓存会被判定为 False, 导致缓存永远不生效
         if self._cache is not None:
             cached = self._cache.get(q_info)
             if cached:
+                cached.has_image = has_image
                 with self._stat_lock:
                     self.cache_hits += 1
                 logger.info(f"[AI] 命中缓存: {q_info.get('title', '')[:40]} -> {cached.text}")
                 return cached
 
-        messages = self._build_messages(q_info)
+        messages = self._build_messages(q_info, has_image=has_image)
         answer = self._ask(messages, q_info)
         if answer is None:
             return None
+        answer.has_image = has_image
+        if has_image:
+            with self._stat_lock:
+                self.image_questions += 1
+            logger.warning(
+                f"[AI] 图片题(模型只看到图片链接, 看不到图), 答案仅供参考: "
+                f"{q_info.get('title', '')[:40]}"
+            )
 
         problem = self._postprocess(q_info, answer)
         if problem:
@@ -318,13 +382,21 @@ class AISolver:
             repaired = self._ask(repair_messages, q_info)
             if repaired is not None and not self._postprocess(q_info, repaired):
                 repaired.repaired = True
+                repaired.has_image = has_image
                 answer = repaired
             else:
                 logger.warning("[AI] 纠错后仍不合法, 本题放弃 AI 答案")
                 return None
 
         if self._cache is not None:
-            self._cache.put(q_info, answer)
+            if answer.confidence and answer.confidence < CACHE_MIN_CONFIDENCE:
+                # 低置信度基本等于猜的, 缓存下来只会让下一次也照着错
+                logger.info(
+                    f"[AI] 置信度 {answer.confidence:.2f} 偏低, 本题答案不写入缓存: "
+                    f"{q_info.get('title', '')[:30]}"
+                )
+            else:
+                self._cache.put(q_info, answer)
         return answer
 
     def solve_many(self, questions: list[dict[str, Any]]) -> dict[str, AIAnswer]:
@@ -373,7 +445,8 @@ class AISolver:
             return False, "未填写 API Key"
         try:
             messages = [{"role": "user", "content": "请只回复 JSON: {\"ok\": true}"}]
-            content = self._request(messages, json_mode=True, max_tokens=32)
+            # 开深度思考时不能用 32 这种小额度, 否则思考会把配额吃光返回空内容
+            content = self._request(messages, json_mode=True, max_tokens=None if self.config.thinking else 32)
         except Exception as exc:
             return False, self._explain_error(exc)
 
@@ -382,9 +455,11 @@ class AISolver:
         return False, "接口返回内容异常, 请检查 base_url / model 是否正确"
 
     def stats(self) -> str:
+        extra = f", 其中图片题 {self.image_questions} 题(模型看不到图)" if self.image_questions else ""
         return (
             f"请求 {self.requests} 次, 失败 {self.failures} 次, 纠错 {self.repairs} 次, "
             f"缓存命中 {self.cache_hits} 次, tokens 输入 {self.prompt_tokens} / 输出 {self.completion_tokens}"
+            f"{extra}"
         )
 
     # --------------------------------------------------------- 提示词
@@ -398,7 +473,7 @@ class AISolver:
                 letters.append(matched.group(1).upper())
         return letters
 
-    def _build_messages(self, q_info: dict[str, Any]) -> list[dict[str, str]]:
+    def _build_messages(self, q_info: dict[str, Any], has_image: bool = False) -> list[dict[str, str]]:
         q_type = q_info.get("type", "unknown")
         type_cn = TYPE_CN.get(q_type, "题目")
         lines = [f"题型：{type_cn}", f"题目：{q_info.get('title', '')}"]
@@ -409,7 +484,13 @@ class AISolver:
         if q_type == "multiple":
             letters = "/".join(self._option_letters(q_info))
             if letters:
-                lines.append(f"（本题为多选，答案字母必须来自 {letters}，至少两个）")
+                lines.append(f"（本题为多选，答案字母必须来自 {letters}；只选有依据的，不要凑数）")
+
+        if has_image:
+            lines.append(
+                "（注意：本题题干或选项里有图片，图片内容你无法读取，"
+                "只能根据文字信息推断；信息不足时把 confidence 调低，不要编造条件）"
+            )
         return [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": "\n".join(lines)},
@@ -452,7 +533,8 @@ class AISolver:
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         if not self.config.thinking:
-            # DeepSeek 默认开思考模式, 答题场景关掉更快; 不支持的兼容端点会忽略该字段
+            # 不开深度思考时显式关掉: DeepSeek 默认可能走思考档, 关掉更快更省
+            # (不支持的兼容端点会忽略该字段)
             kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
         last_error: Optional[Exception] = None
@@ -476,6 +558,11 @@ class AISolver:
                 # 鉴权/额度问题重试没意义, 直接抛出
                 if self._is_fatal(exc):
                     raise
+                # 深度思考 + JSON 输出在部分端点不兼容(400), 去掉 JSON 约束改用文本解析
+                if self.config.thinking and "response_format" in kwargs and self._is_bad_request(exc):
+                    kwargs.pop("response_format", None)
+                    logger.warning("[AI] 思考模式与 JSON 输出不兼容, 本次请求改为纯文本解析")
+                    continue
 
             if attempt < self.config.max_retries:
                 backoff = min(8.0, 1.5 ** attempt)
@@ -497,6 +584,11 @@ class AISolver:
     def _is_fatal(exc: Exception) -> bool:
         status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
         return status in {401, 402, 403}
+
+    @staticmethod
+    def _is_bad_request(exc: Exception) -> bool:
+        status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        return status == 400
 
     @staticmethod
     def _explain_error(exc: Exception) -> str:
@@ -712,6 +804,7 @@ def configure_default_solver(raw_config: Optional[dict[str, Any]]) -> AISolver:
         if config.enabled:
             logger.info(
                 f"[AI] 已启用 DeepSeek 答题: 模型 {config.model}, 模式 {config.mode}, "
+                f"深度思考 {'开' if config.thinking else '关'}, max_tokens {config.max_tokens}, "
                 f"Key {config.masked_key()}"
             )
         elif raw_config:

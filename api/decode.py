@@ -345,6 +345,9 @@ def _process_video_task(card: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "attDuration": card.get("attDuration", ""),
             "attDurationEnc": card.get("attDurationEnc", ""),
             "videoFaceCaptureEnc": card.get("videoFaceCaptureEnc", ""),
+            # 保留原始卡片: 视频内嵌题(弹窗题)的数据只存在这里,
+            # 之前只挑 7 个字段, 题目信息被整块丢掉了。
+            "raw_card": card,
         }
     except KeyError:
         logger.warning("出现转码失败视频，已跳过...")

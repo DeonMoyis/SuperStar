@@ -22,7 +22,7 @@ from api.ai_solver import (
     release_default_solver,
 )
 from api.auto_answer import AutoAnswer, normalize_answer_config
-from api.base import Chaoxing, Account, StudyResult
+from api.base import Chaoxing, Account, StudyResult, configure_video_debug
 from api.exceptions import LoginError, InputFormatError
 from api.logger import configure_console_logger, logger
 from api.notification import Notification
@@ -125,6 +125,10 @@ def parse_args():
         "--answer-debug", action="store_true",
         help="把抓到的作业/考试原始页面存到 answer_debug/ 目录, 用于排查解析问题"
     )
+    parser.add_argument(
+        "--video-debug", action="store_true",
+        help="视频刷不过去时, 把卡片/状态/上报响应存到 video_debug/ 目录, 用于定位原因"
+    )
     # 考试开关: 考试通常是「学完一定进度才解锁」的, 要不要考交给你决定。
     # 不传时跟随配置文件 [answer] exam 的值。
     parser.add_argument(
@@ -144,6 +148,10 @@ def parse_args():
     parser.add_argument(
         "--ai-mode", type=str, default=None, choices=["fallback", "priority", "off"],
         help="AI 使用方式: fallback-题库优先AI兜底(默认), priority-AI优先, off-关闭"
+    )
+    parser.add_argument(
+        "--ai-thinking", dest="ai_thinking", action=argparse.BooleanOptionalAction, default=None,
+        help="开启深度思考: 需要推导的题更准, 但更慢更贵; 用 --no-ai-thinking 关闭(默认关)"
     )
 
     # 在解析之前捕获 -h 的行为
@@ -240,6 +248,8 @@ def build_config_from_args(args):
         ai_config["model"] = args.ai_model
     if getattr(args, "ai_mode", None):
         ai_config["mode"] = args.ai_mode
+    if getattr(args, "ai_thinking", None) is not None:
+        ai_config["thinking"] = "true" if args.ai_thinking else "false"
 
     common_config = {
         "use_cookies": args.use_cookies,
@@ -254,6 +264,7 @@ def build_config_from_args(args):
         "answer_only": getattr(args, "answer_only", False),
         "answer": answer_config,
         "answer_order": getattr(args, "answer_order", None) or "after",
+        "video_debug": getattr(args, "video_debug", False),
         "ai": ai_config,
     }
     return common_config, {}, {}
@@ -295,6 +306,8 @@ def init_config():
             ai_raw["model"] = args.ai_model
         if getattr(args, "ai_mode", None):
             ai_raw["mode"] = args.ai_mode
+        if getattr(args, "ai_thinking", None) is not None:
+            ai_raw["thinking"] = "true" if args.ai_thinking else "false"
         common_config["ai"] = ai_raw
         return common_config, tiku_config, notification_config
     else:
@@ -772,6 +785,9 @@ def main():
         # 时间盒: 到点后不再开新任务, 正在执行的任务跑完后退出
         runtime_budget.configure(common_config.get("max_runtime_minutes"))
 
+        # 视频诊断: 卡住时把卡片/状态/上报响应落盘, 用于区分「弹窗题 / 人脸采集 / 风控」
+        configure_video_debug("video_debug" if common_config.get("video_debug") else None)
+
         # 初始化 DeepSeek(没填 api_key 会自动关闭, 不影响其余功能)
         ai_config = normalize_ai_config(common_config.get("ai"))
         ai_solver = configure_default_solver(common_config.get("ai"))
@@ -871,6 +887,25 @@ def main():
             logger.info("所有课程学习任务已完成")
 
         # ---- 汇总 ----
+        # 卡住的视频任务点: 进度到片尾但服务端不认通过, 程序侧已经推不动了
+        stuck_summary = ""
+        stuck_points = getattr(chaoxing, "stuck_points", None) or []
+        if stuck_points:
+            lines = []
+            for p in stuck_points:
+                line = f"  - {p.get('name')}: {p.get('reason')}"
+                if p.get("has_face_capture"):
+                    line += " (开了人脸采集, 需要本人过人脸)"
+                elif p.get("question_count"):
+                    line += f" (视频内有 {p['question_count']} 道弹窗题)"
+                lines.append(line)
+            stuck_summary = "\n".join(lines)
+            logger.warning(
+                f"有 {len(stuck_points)} 个视频任务点刷不过去, 需要人工处理:\n{stuck_summary}"
+            )
+            if common_config.get("video_debug"):
+                logger.warning("诊断数据已存到 video_debug/ 目录, 可据此确认具体原因")
+
         answer_summary = ""
         if stats_list:
             answer_summary = "\n".join(stats.summary() for stats in stats_list)
@@ -890,6 +925,8 @@ def main():
             done_msg = "chaoxing : 所有课程学习任务已完成"
         if answer_summary:
             done_msg += "\n" + answer_summary
+        if stuck_summary:
+            done_msg += "\n需人工处理的视频任务点:\n" + stuck_summary
         done_msg += "\n" + runtime_budget.summary()
         logger.info(runtime_budget.summary())
         logger.info(done_msg)

@@ -207,6 +207,7 @@ Actions 页面上有两个地方，别搞混：
 | `AUTO_ANSWER` | `true` / `false` | 有 Key 就 `true` | 是否做作业/考试 |
 | `ANSWER_EXAM` | `true` / `false` | `true` | **是否让程序代考**，设 `false` 只做作业 |
 | `ANSWER_ORDER` | `after` / `before` / `both` | `after` | 作业和刷课谁先做，见 [作业与考试](#作业与考试) |
+| `VIDEO_DEBUG` | `true` / `false` | `false` | 排查「视频刷不过去」时设 `true`，诊断数据存到 `video_debug/` |
 
 `ANSWER_EXAM = false` 是为了这种情况：考试通常是「学完一定进度才解锁」的，而且**次数有限、交了就改不了**。你可能希望作业交给程序，考试自己考。设成 `false` 后，程序会跳过考试列表，作业照做。
 
@@ -458,12 +459,12 @@ provider = TikuGo,DeepSeek
 | `model` | 模型名 | `deepseek-flash` |
 | `mode` | `fallback` 题库优先 / `priority` AI 优先 / `off` 关闭 | `fallback` |
 | `temperature` | 答题建议 0~0.3 | `0.2` |
-| `max_tokens` | 单题输出上限 | `1024` |
+| `max_tokens` | 单题输出上限（开 `thinking` 时自动抬到 4096） | `1024` |
 | `timeout` | 单次请求超时（秒） | `60` |
 | `max_retries` | 单题重试次数 | `3` |
 | `concurrency` | 并发请求数，太高会 429 | `4` |
 | `min_interval_seconds` | 两次请求最小间隔，0 不限 | `0` |
-| `thinking` | 深度思考，答题建议关 | `false` |
+| `thinking` | 深度思考：推理题更准，但更慢更贵 | `false` |
 | `cache` / `cache_file` | 缓存开关 / 路径 | `true` / `ai_cache.json` |
 | `check_connection` | 启动时校验 Key | `true` |
 
@@ -511,9 +512,11 @@ python main.py --help
 | `--answer-order` | `after` / `before` / `both`：作业和刷课谁先做 |
 | `--exam` / `--no-exam` | **是否处理考试** |
 | `--answer-debug` | 保存原始页面，排查解析问题 |
+| `--video-debug` | 保存卡住视频的卡片/状态/响应，排查「刷不过去」 |
 | `--deepseek-key` | DeepSeek Key |
 | `--ai-model` | 模型名，默认 `deepseek-flash` |
 | `--ai-mode` | `fallback` / `priority` / `off` |
+| `--ai-thinking` / `--no-ai-thinking` | 开启 / 关闭深度思考（默认关） |
 
 命令行优先级高于配置文件。
 
@@ -538,6 +541,18 @@ DeepSeek 需要充值，新账号赠送额度用完后返回 402。
 
 **Q：作业/考试没解析出题目？**
 用 `--answer-debug` 跑一次，原始页面会存到 `answer_debug/`。看是列表页还是答题页结构变了（列表页一条都没解析出来时，即使没开 debug 也会自动存）。
+
+**Q：某个视频进度到 100% 了，日志却报「任务点卡死」或「进度已到片尾但仍未通过」？**
+
+说明这个任务点靠上报进度已经推不动了，服务端不认。加 `--video-debug` 重跑一次，日志和 `video_debug/` 会直接告诉你是哪一种：
+
+| 日志里的判定 | 含义 | 能不能自动解决 |
+| --- | --- | --- |
+| `卡片里带弹窗题` | 视频中途有内嵌小题，没答服务端就不算完成 | 程序会识别并用大模型作答，答案打在 `[视频弹窗题]` 日志里 |
+| `该视频开启人脸采集` | `videoFaceCaptureEnc` 非空，要真人过人脸 | ❌ 纯 HTTP 做不到，得去网页端 / App |
+| `卡片里没发现弹窗题…` | 既没题目也没人脸，通常是服务端状态延迟或风控 | 换个时间重跑，或把 `--jobs` 保持 1 |
+
+被跳过的任务点不会让整章失败，程序会在结束时汇总成「需人工处理的视频任务点」，下次运行会自动重新检查。
 
 **Q：考试答完了但没交卷？**
 部分考试的提交入口是 JS 动态触发的。程序会优先用页面的 `<form action>`，失败再试固定接口，仍有小概率对不上。这种情况答案通常已经填好，去网页端手动点交卷即可，日志会出现 `提交返回异常, 请到网页端手动确认`。
