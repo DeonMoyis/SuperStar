@@ -646,9 +646,5 @@ python tests/test_runtime_budget.py  # 时长上限 / 到点跳过 / 不卡死�
 <a href="https://github.com/Samueli924/chaoxing" target="blank">灵感来源：Samueli924/chaoxing</a>
 
 + ZhangBowen
-+ LiJiahui
-+ YinZhengke
-+ LiuLizhe
-+ JiangQin
 
 > 本项目仅供学习交流使用。请遵守所在学校的规定，因使用本程序产生的一切后果由使用者自行承担。
