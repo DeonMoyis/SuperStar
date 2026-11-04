@@ -1,19 +1,23 @@
 # -*- coding: utf-8 -*-
-"""任务点卡死保护 + 「未完成就从头重播」测试
+"""任务点卡死保护 + 重播策略测试
 
-超星有一类任务点: playTime 已经等于 duration, 但 isPassed 一直返回 false
-(典型原因是还有弹窗题/章节测验没做)。旧实现在这里会死循环:
+超星有一类任务点: playTime 已经等于 duration, 但 isPassed 一直返回 false。
+旧实现在这里会死循环(play_time == duration 让上报条件永远成立, 而它不可能再增长,
+且旧代码跳过了 sleep, 变成无间隔刷接口)。
 
-  - play_time == duration 让上报条件永远成立
-  - play_time 不可能再增长, 循环永远退不出去
-  - 而且 play_time == duration 时旧代码跳过了 sleep, 变成无间隔刷接口
+现在分成三种情况, 本文件逐条验证:
 
-结果就是整个 job 挂到 Actions 超时, 同时把接口刷到风控。
-现在的处理是两级:
+  1. **起点就在片尾** —— 已经全看过了, 再播一遍是重复劳动, 不重播;
+  2. **从 0 播到片尾不认** —— 已经真播过一遍, 也不重播;
+  3. **从中断处续播到片尾不认** —— 服务端可能认为观看不连续, 从头真播一次
+     (只一次, 重播后仍不认就放弃);
 
-  1. 限次重试后仍不认账 -> 判定「卡住」;
-  2. 卡住就忽略已记录进度, 从 0 秒重新播一遍(本文件重点验证这条);
-     重播还不行才真正放弃, 保证不会无限重播。
+另外还验证两件事:
+
+  * 片尾不认时先按真人节奏退避重试几轮(超星落库经常滞后十几秒),
+    不能 3 秒就判死;
+  * 从 0 秒开始的视频, 开播前不再发 isdrag=4 的「已到片尾」探测 ——
+    那等于主动告诉服务端「我把进度条拖到底了」, 会被防拖拽校验记一笔。
 """
 import sys
 import time
@@ -74,9 +78,8 @@ def make_chaoxing(duration, pass_at):
     def fake_progress_log(_session, _course, _job, _job_info, _dtoken, _duration,
                           _playingTime, _type="Video", _isdrag=3, headers=None):
         calls.append((_isdrag, int(_playingTime)))
-        # _isdrag=4 是开播前的"是否已完成"探测, 这里统一回答"没完成",
-        # 这样才能真正走进播放循环(否则会被"瞬间完成"提前放行)
         if _isdrag == 4:
+            # 冲刺/片尾重试探测: 这类测试里统一回答"没完成"
             return (False, 200)
         if pass_at is None:
             return (False, 200)
@@ -94,15 +97,15 @@ def setup(duration):
 def run_without_sleeping(chaoxing, play_ms):
     """把 sleep 换成空操作, 否则退避会让测试跑上十几秒
 
-    注意: 播放进度是按真实时间推进的, 所以视频时长不能设太大,
-    否则测试本身就要等那么久。
+    播放进度是按真实时间推进的, 所以视频时长不能设太大。
     """
     real_sleep = time.sleep
     time.sleep = lambda *_: None
     try:
         return chaoxing.study_video(
             {"courseId": "1", "clazzId": "2"},
-            {"objectid": "obj-1", "name": "卡死视频", "playTime": play_ms, "mid": "mid-1"},
+            {"objectid": "obj-1", "name": "卡死视频", "playTime": play_ms,
+             "mid": "mid-1", "videoFaceCaptureEnc": ""},
             {},
         )
     finally:
@@ -110,56 +113,102 @@ def run_without_sleeping(chaoxing, play_ms):
 
 
 # ---------------------------------------------------------------- 起点即片尾
-def test_play_time_at_end_replays_from_zero():
-    """playTime == duration 但服务端不认通过: 限次重试后判定卡住, 并从头重播"""
+def test_start_at_end_replays_once():
+    """playTime == duration 但服务端不认: 退避重试后, 仍从头真播一次
+
+    线上的 4.2 视频就是这个形态: 第一遍已经播满, 服务端 isPassed 迟迟不置 true,
+    从头真播一遍之后才认 —— 超星校验的是「连续观看」, 不是「进度数字到顶」。
+    """
     duration = 3
     setup(duration)
     chaoxing, calls = make_chaoxing(duration, pass_at=None)
 
-    started = time.time()
     result = run_without_sleeping(chaoxing, duration * 1000)
-    elapsed = time.time() - started
 
     assert result == base.StudyResult.SKIPPED, f"重播仍失败应跳过, 实际 {result}"
     probes = [c for c in calls if c[0] == 4]
-    # 冲刺探测 + 限次重试, 不该出现几十上百次
-    assert len(probes) <= 1 + base.STUCK_END_RETRY, f"片尾探测 {len(probes)} 次, 超出预期"
-    # 关键: 卡住之后确实从 0 开始重播了(旧实现这里直接放弃, 不会有 isdrag=3 的上报)
-    assert any(isdrag == 3 for isdrag, _ in calls), "没有从头重播, 仍是旧行为"
-    assert elapsed < 20, f"耗时 {elapsed:.2f}s, 可能重播了不止一次"
-    print(f"[ok] 起点即片尾: {len(probes)} 次探测后从头重播, 最终 {result.name}, 耗时 {elapsed:.2f}s")
+    # 第一轮: 1 次冲刺探测 + STUCK_END_RETRY 次片尾重试; 重播轮: 只有 STUCK_END_RETRY 次
+    assert len(probes) == 1 + 2 * base.STUCK_END_RETRY, f"片尾探测 {len(probes)} 次, 与预期轮次不符"
+    print(f"[ok] 起点即片尾: {len(probes)} 次探测, 退避重试后从头重播一次")
 
 
-# ---------------------------------------------------------------- 播完不放行
-def test_finished_but_not_passed_gives_up():
-    """从头播到片尾, 服务端始终不放行: 连续无进展后判定卡死, 重播一次后放弃"""
+# ---------------------------------------------------------------- 从 0 播完不认
+def test_finished_from_zero_replays_once():
+    """从 0 秒真播到片尾, 服务端始终不放行: 重播一次后放弃, 不会无限重播"""
     duration = 3
     setup(duration)
     chaoxing, calls = make_chaoxing(duration, pass_at=None)
 
-    started = time.time()
     result = run_without_sleeping(chaoxing, 0)
-    elapsed = time.time() - started
 
-    assert result == base.StudyResult.SKIPPED, f"应判定卡死并跳过, 实际 {result}"
-    assert elapsed < 20, f"耗时 {elapsed:.2f}s, 卡死检测或重播次数失控"
-    assert len(calls) <= 2 * (duration + base.STALL_LIMIT + 3), f"上报次数 {len(calls)} 超出预期"
-    print(f"[ok] 播完不放行: {len(calls)} 次上报, {elapsed:.2f}s 后放弃")
+    assert result == base.StudyResult.SKIPPED, f"应跳过, 实际 {result}"
+    played = [c for c in calls if c[0] == 3]
+    assert played, "应该有正常播放上报"
+    probes = [c for c in calls if c[0] == 4]
+    # 从 0 开始的视频开播前不发冲刺探测, 所以两轮各 STUCK_END_RETRY 次
+    assert len(probes) == 2 * base.STUCK_END_RETRY, f"片尾探测 {len(probes)} 次, 重播次数不对"
+    # 两轮播放, 每轮上报次数约 duration + STALL_LIMIT, 不该失控
+    assert len(played) <= 2 * (duration + base.STALL_LIMIT + 2), f"上报次数 {len(played)} 超出预期"
+    print(f"[ok] 从 0 播完不认: 重播一次后放弃, 共 {len(calls)} 次上报")
 
 
-# ---------------------------------------------------------------- 只重播一次
-def test_replays_only_once():
-    """重播必须只做一次, 否则就是换了个形式的死循环"""
-    duration = 2
+# ---------------------------------------------------------------- 续播 -> 重播一次
+def test_resume_replays_exactly_once():
+    """从断点续播到片尾不认: 从头真播一次(只一次), 仍不认才放弃"""
+    duration = 4
     setup(duration)
     chaoxing, calls = make_chaoxing(duration, pass_at=None)
 
+    result = run_without_sleeping(chaoxing, 2 * 1000)
+
+    assert result == base.StudyResult.SKIPPED, f"应跳过, 实际 {result}"
+    # 正常上报只在片尾才发(间隔 wait_time 30~90s), 所以用「片尾探测次数」倒推轮次:
+    #   第一轮 = 1 次冲刺探测 + STUCK_END_RETRY 次片尾重试
+    #   重播轮 = 0 次冲刺探测 + STUCK_END_RETRY 次片尾重试
+    probes = [c for c in calls if c[0] == 4]
+    assert len(probes) == 1 + 2 * base.STUCK_END_RETRY, f"重播次数不对: {len(probes)} 次探测"
+    print(f"[ok] 续播不认: 从头重播一次后放弃, 共 {len(probes)} 次片尾探测 / {len(calls)} 次上报")
+
+
+# ---------------------------------------------------------------- 片尾重试能救回来
+def test_retry_at_end_can_rescue():
+    """服务端只是落库慢: 片尾退避重试期间认了, 就应该算完成, 不该白重播"""
+    duration = 3
+    setup(duration)
+    chaoxing = object.__new__(base.Chaoxing)
+    chaoxing.get_fid = lambda: 1024
+    chaoxing.kwargs = {}
+    probe_calls = {"n": 0}
+
+    def fake_progress_log(_session, _course, _job, _job_info, _dtoken, _duration,
+                          _playingTime, _type="Video", _isdrag=3, headers=None):
+        if _isdrag == 4:
+            probe_calls["n"] += 1
+            # 第 2 次片尾探测才认(模拟服务端延迟了一轮)
+            return (probe_calls["n"] >= 2, 200)
+        return (False, 200)
+
+    chaoxing.video_progress_log = fake_progress_log
+
+    result = run_without_sleeping(chaoxing, 0)
+
+    assert result == base.StudyResult.SUCCESS, f"片尾重试后应判定完成, 实际 {result}"
+    print(f"[ok] 片尾延迟: 第 {probe_calls['n']} 次探测后认可, 未重播")
+
+
+# ---------------------------------------------------------------- 开播不探测
+def test_no_end_probe_when_playing_from_zero():
+    """从 0 开始看的视频, 开播前不该发 isdrag=4 的「已到片尾」探测"""
+    duration = 3
+    setup(duration)
+    chaoxing, calls = make_chaoxing(duration, pass_at=duration)
+
     run_without_sleeping(chaoxing, 0)
 
-    # 每次尝试最多 1 次冲刺探测; 重播模式不再探测, 所以探测次数直接暴露尝试次数
-    probes = [c for c in calls if c[0] == 4]
-    assert len(probes) <= 1 + base.STUCK_END_RETRY, probes
-    print(f"[ok] 只重播一次: 全程 {len(probes)} 次冲刺探测, 共 {len(calls)} 次上报")
+    first = calls[0]
+    assert first[0] != 4, f"首个请求不该是拖拽探测, 实际 isdrag={first[0]}"
+    assert not any(isdrag == 4 and t >= duration for isdrag, t in calls[:1]), "不该一开播就报满进度"
+    print("[ok] 从 0 播放: 开播前无拖拽探测, 首报就是真实播放上报")
 
 
 # ---------------------------------------------------------------- 正常放行
@@ -175,21 +224,22 @@ def test_normal_video_still_succeeds():
         started = time.time()
         result = chaoxing.study_video({"courseId": "1", "clazzId": "2"},
                                       {"objectid": "obj-1", "name": "正常视频", "playTime": 0,
-                                       "mid": "mid-1"}, {})
+                                       "mid": "mid-1", "videoFaceCaptureEnc": ""}, {})
         elapsed = time.time() - started
     finally:
         time.sleep = real_sleep
 
     assert result == base.StudyResult.SUCCESS, result
-    assert calls[0][0] == 4, "首个请求应为冲刺检测(_isdrag=4)"
     assert calls[-1][1] >= duration, calls
     assert elapsed < 8, f"sleep 已被替换成空操作, 耗时应很短, 实际 {elapsed:.2f}s"
     print(f"[ok] 正常视频: 返回 SUCCESS, {len(calls)} 次上报")
 
 
 if __name__ == "__main__":
-    test_play_time_at_end_replays_from_zero()
-    test_finished_but_not_passed_gives_up()
-    test_replays_only_once()
+    test_start_at_end_replays_once()
+    test_finished_from_zero_replays_once()
+    test_resume_replays_exactly_once()
+    test_retry_at_end_can_rescue()
+    test_no_end_probe_when_playing_from_zero()
     test_normal_video_still_succeeds()
     print("\n全部通过")

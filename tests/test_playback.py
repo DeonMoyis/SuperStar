@@ -154,7 +154,10 @@ def test_single_video_runs_at_real_time():
     assert duration - 0.5 <= elapsed <= duration + 3.5, (
         f"{duration}s 视频用 1 倍速应约 {duration}s, 实际 {elapsed:.2f}s"
     )
-    assert log_calls[0][0] == 4, "首个请求应为冲刺检测(_isdrag=4)"
+    # 从 0 开始看的视频开播前不该发 isdrag=4 的「已到片尾」探测:
+    # 那等于主动告诉服务端「我把进度条拖到底了」, 会被防拖拽校验记一笔
+    assert log_calls[0][0] != 4, f"从 0 播放不该先发拖拽探测, 实际 isdrag={log_calls[0][0]}"
+    assert log_calls[-1][1] >= duration, f"最后上报应到片尾, 实际 {log_calls[-1][1]}"
     print(f"[ok] 单视频 1 倍速: 视频 {duration}s, 实际耗时 {elapsed:.2f}s")
 
 

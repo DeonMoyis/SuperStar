@@ -171,8 +171,9 @@ class StudyResult(Enum):
 # 卡死保护: 有些任务点的 playTime 已经等于 duration, 但服务端 isPassed 一直是 false
 # (常见于还有弹窗题/章节测验没做)。这种任务点再怎么上报都不会通过, 只会把接口打爆,
 # 所以限制重试次数后明确放弃, 留给下次运行或人工处理。
-STUCK_END_RETRY = 3     # 片尾仍不通过时, 额外重试几次
+STUCK_END_RETRY = 5     # 片尾仍不通过时, 额外重试几次(合计等 1~2 分钟)
 STALL_LIMIT = 3         # 连续多少次上报进度都没前进就判定卡死
+END_PROBE_TOLERANCE = 5  # 记录进度离片尾多近时, 开播前才发一次「已看完」探测
 
 # ===== 视频卡住诊断 =====
 # 「进度推到片尾, 服务端 isPassed 仍是 false」有三种常见原因, 光看日志分不出来:
@@ -771,6 +772,31 @@ class Chaoxing:
         record_skip("video", job, reason_code, reason=reason, course=course_name)
         return record
 
+    def _retry_at_end(self, _session, _course, _job, _job_info, _dtoken,
+                      duration: int, _type, headers) -> bool:
+        """进度已到片尾、服务端却不认通过时, 按接近真人的节奏再等几轮
+
+        超星把 `isPassed` 落库经常滞后十几秒。旧实现在片尾是「每 1 秒上报一次、
+        连续 3 次没进展就判卡死」—— 那等于只给服务端 3 秒, 明明只是延迟也会被判死,
+        接着白白从头重播一整遍视频(7 分钟的视频就是 7 分钟)。
+        """
+        for attempt in range(1, STUCK_END_RETRY + 1):
+            delay = random.uniform(12, 25)
+            logger.info(
+                "进度已到片尾但服务端未认通过, {:.0f}s 后重试 ({}/{})",
+                delay, attempt, STUCK_END_RETRY,
+            )
+            time.sleep(delay)
+            passed, state = self.video_progress_log(
+                _session, _course, _job, _job_info, _dtoken, duration, duration,
+                _type, headers=headers, _isdrag=4,
+            )
+            if passed:
+                return True
+            if state not in (200, 403):
+                break
+        return False
+
     def _diagnose_stuck_video(self, job: dict, status_json: Optional[dict] = None,
                               reason: str = "") -> dict:
         """把「这个视频为什么刷不过去」写进日志
@@ -793,13 +819,25 @@ class Chaoxing:
             }
 
         last_resp = getattr(self, "_last_video_resp", None) or ""
+        try:
+            recorded = int(job.get("playTime") or 0) // 1000
+        except (TypeError, ValueError):
+            recorded = 0
         diag = {
             "任务点": job.get("name"),
             "jobid": job.get("jobid"),
             "objectid": job.get("objectid"),
             "判定原因": reason,
+            # 下面这几个字段是「服务端到底为什么不认」的线索:
+            # 记录进度 = 上次留下的断点, attDuration* 是服务端下发的时长校验串,
+            # rt 是播放倍速标记, otherInfo 里带节点/加密信息, 排查风控时要一起看。
+            "记录进度": recorded,
             "卡片诊断": summary,
             "status 关键字段": status_info,
+            "attDuration": job.get("attDuration"),
+            "attDurationEnc": job.get("attDurationEnc"),
+            "rt": job.get("rt"),
+            "otherInfo": job.get("otherInfo"),
             "最近一次上报响应": last_resp[:1500],
         }
 
@@ -1083,7 +1121,8 @@ class Chaoxing:
             return result
 
         logger.warning(
-            "任务点未完成({}), 按「未完成就从头看」的策略忽略已记录进度, 从 0 秒重新播放: {}",
+            "任务点未完成({}), 本次只做了「从断点续播」, 服务端可能认为观看不连续: "
+            "忽略已记录进度, 从 0 秒重新播放一次: {}",
             result.name, _job.get("name"),
         )
         replayed, _ = self._study_video_once(
@@ -1157,8 +1196,16 @@ class Chaoxing:
         passed = False
 
         # 冲刺探测: 上报一个"已到片尾"的进度, 服务端认了就直接结束。
-        # 重播模式下要真播一遍, 不能再用这一招, 否则等于自欺欺人。
-        if not restart_from_zero:
+        #
+        # 只在「记录的进度确实已经在片尾附近」时才发。旧实现是无条件发 ——
+        # 于是从 0 秒开始看的视频, 开播第一个请求就是 isdrag=4 + playingTime=duration,
+        # 等于主动告诉服务端「我把进度条拖到底了」。开了防拖拽校验的课程会因此
+        # 再也不认通过(真播到片尾也是 isPassed=false), 这也是线上 4.2 那个视频的疑点。
+        near_end = (
+            recorded_play_time > 0
+            and recorded_play_time >= max(0, duration - END_PROBE_TOLERANCE)
+        )
+        if not restart_from_zero and near_end:
             passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
                                                     duration, _type, headers=headers, _isdrag=4)
             if passed:
@@ -1184,7 +1231,10 @@ class Chaoxing:
                     _job['name'], format_duration(play_time), format_duration(duration),
                 )
                 self._diagnose_stuck_video(_job, _video_info, "进度到片尾但服务端不认通过")
-                return StudyResult.SKIPPED, True
+                # 起点就在片尾也要从头真播一遍: 超星校验的是「连续观看」,
+                # 上一次运行断在中途时, 只有从 0 连续播下去服务端才肯认
+                # (线上 4.2 那个 451s 的视频就是这样才过的)。
+                return StudyResult.SKIPPED, not restart_from_zero
 
         # 倍速统一由 api/playback.py 钉死为 1.0, 外部传入的 _speed 一律忽略
         _speed = FORCED_SPEED
@@ -1258,17 +1308,50 @@ class Chaoxing:
                             else:
                                 stall_count += 1
                                 if stall_count >= STALL_LIMIT:
-                                    logger.error(
-                                        "任务点连续 {} 次上报进度都没有前进, 判定卡死: {} "
-                                        "(进度 {} / 总时长 {})。本次跳过。",
-                                        stall_count, _job['name'],
-                                        format_duration(play_time), format_duration(duration),
-                                    )
+                                    at_end = int(play_time) >= duration
+                                    if at_end:
+                                        # 片尾不认 ≠ 程序卡死。先按真人的节奏等几轮 ——
+                                        # 超星把 isPassed 落库经常滞后十几秒, 只等 3 秒就判死
+                                        # 会把「其实马上就好了」误判成过不去。
+                                        if self._retry_at_end(
+                                            _session, _course, _job, _job_info, _dtoken,
+                                            duration, _type, headers,
+                                        ):
+                                            logger.info("片尾重试后服务端认可完成: {}", _job['name'])
+                                            break
+                                        logger.error(
+                                            "任务点进度已到片尾, 额外重试 {} 次后服务端仍不认通过: {} "
+                                            "(进度 {} / 总时长 {})",
+                                            STUCK_END_RETRY, _job['name'],
+                                            format_duration(play_time), format_duration(duration),
+                                        )
+                                    else:
+                                        logger.error(
+                                            "任务点连续 {} 次上报进度都没有前进, 判定卡死: {} "
+                                            "(进度 {} / 总时长 {})。",
+                                            stall_count, _job['name'],
+                                            format_duration(play_time), format_duration(duration),
+                                        )
                                     self._diagnose_stuck_video(
                                         _job, _video_info,
-                                        f"连续 {stall_count} 次上报进度无变化",
+                                        "进度到片尾但服务端不认通过" if at_end
+                                        else f"连续 {stall_count} 次上报进度无变化",
                                     )
-                                    return StudyResult.SKIPPED, True
+                                    # 要不要从头重播:
+                                    #   * 片尾不认 -> 内容一模一样, 再播一遍不会改变结果;
+                                    #     只有「本次是从中断处续播」时, 从 0 真播一遍才可能有用;
+                                    #   * 中途卡死 -> 可能只是网络/上报断了, 值得从头播。
+                                    if at_end:
+                                        can_restart = not restart_from_zero
+                                        if can_restart:
+                                            logger.warning(
+                                                "超星按「连续观看」校验, 从 {} 接着播服务端不认, "
+                                                "从头真播一遍再试: {}",
+                                                format_duration(recorded_play_time), _job['name'],
+                                            )
+                                    else:
+                                        can_restart = True
+                                    return StudyResult.SKIPPED, can_restart
 
                         wait_time = int(random.uniform(30, 90))
                         last_log_time = play_time
