@@ -464,7 +464,7 @@ provider = TikuGo,DeepSeek
 | `max_retries` | 单题重试次数 | `3` |
 | `concurrency` | 并发请求数，太高会 429 | `4` |
 | `min_interval_seconds` | 两次请求最小间隔，0 不限 | `0` |
-| `thinking` | 深度思考：推理题更准，但更慢更贵 | `false` |
+| `thinking` | 深度思考，**默认开启**：推理题更准，慢一些也更费 token | `true` |
 | `cache` / `cache_file` | 缓存开关 / 路径 | `true` / `ai_cache.json` |
 | `check_connection` | 启动时校验 Key | `true` |
 
@@ -477,7 +477,7 @@ provider = TikuGo,DeepSeek
 | `enable` | 总开关，等价于 `--auto-answer` | `false` |
 | `work` | 是否处理作业 | `true` |
 | `exam` | **是否处理考试**，等价于 `--exam` / `--no-exam` | `true` |
-| `order` | 作业和刷课谁先做：`before` / `after` / `both` | `before` |
+| `order` | 作业和刷课谁先做：`before` / `after` / `both`，默认先把本节视频看完再做题 | `after` |
 | `submit_policy` | `auto` / `always` / `never`（作业、考试、章节测验共用） | `auto` |
 | `min_cover_rate` | `auto` 模式的最低覆盖率 | `0.9` |
 | `max_tasks` | 每门课最多处理多少份 | `20` |
@@ -516,9 +516,21 @@ python main.py --help
 | `--deepseek-key` | DeepSeek Key |
 | `--ai-model` | 模型名，默认 `deepseek-flash` |
 | `--ai-mode` | `fallback` / `priority` / `off` |
-| `--ai-thinking` / `--no-ai-thinking` | 开启 / 关闭深度思考（默认关） |
+| `--ai-thinking` / `--no-ai-thinking` | 开启 / 关闭深度思考（默认开，省 token 用 `--no-ai-thinking`） |
 
 命令行优先级高于配置文件。
+
+---
+
+## 学习顺序与「从头重播」
+
+一次运行里，每个小节都是这么走的：
+
+1. **先看视频**（音频 / 文档同理），这一节的内容任务点全部走完，才进入本章的测验 / 作业；
+2. 视频中途弹出的题（弹窗题）不会被漏掉：开播前就取到题目和提交地址，播放进度走到弹题时间时**自动作答并提交**，不用等它弹出来把播放卡住；
+3. 视频播到片尾、服务端却不认账（`isPassed` 仍是 `false`）时，程序会**忽略已记录的进度，从 0 秒重新播一遍**；重播还不行才放弃，并记进结尾的「需人工处理的视频任务点」。
+
+想换顺序：`[answer] order = before` 改成先做题再刷课，`both` 表示刷课前后各扫一遍。
 
 ---
 
@@ -548,7 +560,7 @@ DeepSeek 需要充值，新账号赠送额度用完后返回 402。
 
 | 日志里的判定 | 含义 | 能不能自动解决 |
 | --- | --- | --- |
-| `卡片里带弹窗题` | 视频中途有内嵌小题，没答服务端就不算完成 | 程序会识别并用大模型作答，答案打在 `[视频弹窗题]` 日志里 |
+| `卡片里带弹窗题` | 视频中途有内嵌小题，没答服务端就不算完成 | ✅ 开播前就取到题目，播到弹题时间自动作答并提交 |
 | `该视频开启人脸采集` | `videoFaceCaptureEnc` 非空，要真人过人脸 | ❌ 纯 HTTP 做不到，得去网页端 / App |
 | `卡片里没发现弹窗题…` | 既没题目也没人脸，通常是服务端状态延迟或风控 | 换个时间重跑，或把 `--jobs` 保持 1 |
 

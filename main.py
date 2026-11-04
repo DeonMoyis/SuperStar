@@ -906,6 +906,19 @@ def main():
             if common_config.get("video_debug"):
                 logger.warning("诊断数据已存到 video_debug/ 目录, 可据此确认具体原因")
 
+        # 视频弹窗题(视频中途弹出的小题)的作答/提交情况
+        inline_summary = ""
+        inline_stat = getattr(chaoxing, "inline_quiz_stat", None) or {}
+        if inline_stat.get("total"):
+            inline_summary = (
+                f"视频弹窗题: 共 {inline_stat['total']} 道, "
+                f"作答 {inline_stat['answered']} 道, "
+                f"提交成功 {inline_stat['submitted']} 道"
+            )
+            if inline_stat.get("failed"):
+                inline_summary += f", 失败 {inline_stat['failed']} 道"
+            logger.info(inline_summary)
+
         answer_summary = ""
         if stats_list:
             answer_summary = "\n".join(stats.summary() for stats in stats_list)
@@ -925,6 +938,8 @@ def main():
             done_msg = "chaoxing : 所有课程学习任务已完成"
         if answer_summary:
             done_msg += "\n" + answer_summary
+        if inline_summary:
+            done_msg += "\n" + inline_summary
         if stuck_summary:
             done_msg += "\n需人工处理的视频任务点:\n" + stuck_summary
         done_msg += "\n" + runtime_budget.summary()

@@ -117,7 +117,7 @@ class AIConfig:
     max_retries: int = 3
     min_interval_seconds: float = 0.0
     concurrency: int = 4
-    thinking: bool = False          # 深度思考; 需要推导的题打开更准, 但慢且贵 (max_tokens 会自动抬高)
+    thinking: bool = True           # 深度思考(默认开): 推理题更准, 慢一些也更费 token
     cache: bool = True
     cache_file: str = DEFAULT_CACHE_FILE
     mode: str = "fallback"          # fallback-题库优先 / priority-AI优先 / off-关闭
@@ -181,7 +181,7 @@ def normalize_ai_config(raw: Optional[dict[str, Any]]) -> AIConfig:
     config.max_retries = max(1, as_int(get("max_retries", default="3"), 3))
     config.min_interval_seconds = max(0.0, as_float(get("min_interval_seconds", default="0"), 0.0))
     config.concurrency = min(16, max(1, as_int(get("concurrency", default="4"), 4)))
-    config.thinking = as_bool(get("thinking", default="false"), False)
+    config.thinking = as_bool(get("thinking", default="true"), True)
     if config.thinking and config.max_tokens < THINKING_MIN_TOKENS:
         # 思考 token 也算在输出配额里, 1024 会被思考吃光, 导致返回空内容
         logger.info(

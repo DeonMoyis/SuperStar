@@ -65,11 +65,12 @@ def q(qid="1", title="1+1=?", qtype="single", options="A.1\nB.2\nC.3"):
 # ------------------------------------------------------------------ 用例
 
 def test_basic_single():
-    solver, calls = make_solver(['{"answer": ["B"], "confidence": 0.93, "reason": "算术"}'])
+    solver, calls = make_solver(['{"answer": ["B"], "confidence": 0.93, "reason": "算术"}'],
+                                thinking=False)
     answer = solver.solve(q())
     assert answer and answer.answer == ["B"], answer
     assert abs(answer.confidence - 0.93) < 1e-6
-    # 请求里必须有 JSON 模式和关闭思考
+    # 请求里必须有 JSON 模式; 显式关思考时要真的告诉服务端
     kwargs = calls.calls[0]
     assert kwargs["response_format"] == {"type": "json_object"}
     assert kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
@@ -205,7 +206,11 @@ def test_config():
     config = normalize_ai_config({"api_key": "sk-1234567890abcd", "concurrency": "99", "temperature": "5"})
     assert config.concurrency == 16 and config.temperature == 2.0
     assert config.masked_key().startswith("sk-123") and "***" in config.masked_key()
-    # 开深度思考时 max_tokens 必须自动抬高, 否则思考会吃光配额
+    # 深度思考默认开启(用户要求), 且 max_tokens 自动抬高, 否则思考会吃光配额
+    default_cfg = normalize_ai_config({"api_key": "sk-1"})
+    assert default_cfg.thinking is True and default_cfg.max_tokens == 4096, default_cfg
+    # 显式关掉仍然是关的
+    assert normalize_ai_config({"api_key": "sk-1", "thinking": "false"}).thinking is False
     thinking = normalize_ai_config({"api_key": "sk-1", "thinking": "true", "max_tokens": "1024"})
     assert thinking.thinking is True and thinking.max_tokens == 4096, thinking.max_tokens
     # 用户自己填了更大的值就不动

@@ -7,11 +7,18 @@
 这里把「认得出来」和「不乱认」两件事都钉住。
 """
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from api.video_quiz import find_inline_questions, summarize_video_card  # noqa: E402
+import api.base as base  # noqa: E402
+from api.video_quiz import (  # noqa: E402
+    find_inline_questions,
+    option_name_for_letter,
+    parse_quiz_list,
+    summarize_video_card,
+)
 
 
 def test_find_questions_in_card():
@@ -119,10 +126,112 @@ def test_judgement_without_options():
     print("[ok] 无选项的判断题也能识别")
 
 
+# ---------------------------------------------------------------- 作答与提交
+def _quiz_payload(**overrides):
+    """模拟 initdatawithviewerV2 的真实响应结构"""
+    question = {
+        "startTime": 120,
+        "validationUrl": "/mooc-ans/question/quiz-validation?xx=1",
+        "resourceId": "res-1",
+        "description": "政治安全的核心是什么?",
+        "type": "single",
+        "options": [
+            {"name": "A", "description": "政权安全"},
+            {"name": "B", "description": "经济安全"},
+        ],
+    }
+    question.update(overrides)
+    return [{"datas": [question]}]
+
+
+def test_parse_quiz_list():
+    quizzes = parse_quiz_list(_quiz_payload())
+    assert len(quizzes) == 1, quizzes
+    q = quizzes[0]
+    assert q["time"] == 120.0
+    assert q["resourceId"] == "res-1"
+    assert q["validationUrl"].startswith("/mooc-ans/")
+    assert "A.政权安全" in q["options"], q["options"]
+    assert q["optionList"][0]["name"] == "A"
+    print("[ok] 能从 initdata 响应解析出弹窗题(含提交地址)")
+
+
+def test_parse_quiz_list_skips_unsubmittable():
+    """没有 validationUrl 的条目(讲义之类)不该进列表 —— 做了也提交不了"""
+    assert parse_quiz_list(_quiz_payload(validationUrl="")) == []
+    print("[ok] 没有提交地址的条目不当作弹窗题")
+
+
+def test_option_name_for_letter():
+    quiz = {"optionList": [{"name": "opt-1", "description": "甲"},
+                           {"name": "opt-2", "description": "乙"}]}
+    assert option_name_for_letter(quiz, "B") == "opt-2", "要提交服务端的 name, 不是字母"
+    assert option_name_for_letter(quiz, "Z") == "Z"
+    print("[ok] 字母能映射成服务端认的选项 name")
+
+
+def test_due_quiz_submitted_at_pop_time():
+    """进度到弹题时间才提交, 提前不动作"""
+    class FakeEngine:
+        def solve_all(self, questions, title=""):
+            for item in questions:
+                qid = item.get("id") or ""
+                item.setdefault("answerField", {})[f"answer{qid}"] = "A"
+
+            class Report:
+                def summary(self):
+                    return "假报告"
+
+            return Report()
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs.get("params")))
+
+            class Resp:
+                status_code = 200
+                text = '{"status":true}'
+
+            return Resp()
+
+    chaoxing = object.__new__(base.Chaoxing)
+    chaoxing.answer_engine = FakeEngine()
+    chaoxing.inline_quiz_stat = {"total": 1, "answered": 0, "submitted": 0, "failed": 0}
+    chaoxing._inline_lock = threading.Lock()
+    chaoxing._inline_seen = set()
+
+    quizzes = parse_quiz_list(_quiz_payload())
+    session = FakeSession()
+
+    # 还没播到 120 秒: 不提交
+    chaoxing._submit_due_inline_quizzes(session, quizzes, 30, {})
+    assert session.calls == [], session.calls
+
+    # 越过弹题时间: 作答 + 提交
+    chaoxing._submit_due_inline_quizzes(session, quizzes, 121, {})
+    assert len(session.calls) == 1, session.calls
+    url, params = session.calls[0]
+    assert url.startswith("https://mooc1.chaoxing.com/mooc-ans/"), url
+    assert params == {"resourceid": "res-1", "answer": "A"}, params
+    assert chaoxing.inline_quiz_stat["submitted"] == 1
+
+    # 同一道题只提交一次
+    chaoxing._submit_due_inline_quizzes(session, quizzes, 200, {})
+    assert len(session.calls) == 1, "重复提交同一道题"
+    print("[ok] 播到弹题时间才作答并提交, 且只提交一次")
+
+
 if __name__ == "__main__":
     test_find_questions_in_card()
     test_no_false_positive_on_plain_card()
     test_detect_face_capture()
     test_question_dedup()
     test_judgement_without_options()
+    test_parse_quiz_list()
+    test_parse_quiz_list_skips_unsubmittable()
+    test_option_name_for_letter()
+    test_due_quiz_submitted_at_pop_time()
     print("\n全部通过")

@@ -69,8 +69,9 @@ jobs:
           # 可选: 设 true 时, 刷不过去的视频会把卡片/状态/上报响应存到 video_debug/
           #   用来区分「弹窗题 / 人脸采集 / 风控」, 排查完记得关掉
           VIDEO_DEBUG: ${{ vars.VIDEO_DEBUG }}
-          # 可选: 设 true 时 AI 答题开启深度思考(需要推导的题更准, 但更慢更贵, 会多耗 token)
-          #   留空 / false -> 不思考, 快且省
+          # 可选: AI 答题是否开启深度思考, 默认开启(更准, 但更慢更费 token)
+          #   留空 / true -> 开启
+          #   false      -> 关闭, 省 token
           AI_THINKING: ${{ vars.AI_THINKING }}
           # 单次运行时长上限(分钟):
           #   手动触发时填的值 > 仓库 Variables 里的 MAX_RUNTIME_MINUTES > 默认 110
@@ -91,8 +92,11 @@ jobs:
             if [ -n "$DEEPSEEK_API_KEY" ]; then
               args+=(--deepseek-key "$DEEPSEEK_API_KEY")
             fi
-            # 深度思考开关: 只有明确设成 true/1 才开
-            if [ "$AI_THINKING" = "true" ] || [ "$AI_THINKING" = "1" ]; then
+            # 深度思考: 默认开, 只有明确设成 false/0 才关
+            if [ "$AI_THINKING" = "false" ] || [ "$AI_THINKING" = "0" ]; then
+              args+=(--no-ai-thinking)
+              echo "本次 AI 答题关闭深度思考"
+            else
               args+=(--ai-thinking)
               echo "本次 AI 答题开启深度思考"
             fi

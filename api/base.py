@@ -9,6 +9,7 @@ from difflib import SequenceMatcher
 from enum import Enum, IntEnum
 from hashlib import md5
 from typing import Self, Optional, Literal
+from urllib.parse import urljoin
 
 import requests
 from loguru import logger
@@ -30,8 +31,12 @@ from api.decode import (
     decode_questions_info,
 )
 from api.video_quiz import (
+    QUIZ_HOST,
+    QUIZ_LIST_URLS,
     dump_json,
     find_inline_questions,
+    option_name_for_letter,
+    parse_quiz_list,
     summarize_video_card,
 )
 from api.exceptions import MaxRetryExceeded
@@ -234,6 +239,11 @@ class Chaoxing:
         self._last_video_resp: Optional[str] = None
         # 已经作答过的视频弹窗题(按题干/id 去重, 同一道题不重复烧钱)
         self._inline_seen: set[str] = set()
+        # 视频弹窗题的作答/提交统计, 收尾时汇总
+        self.inline_quiz_stat = {"total": 0, "answered": 0, "submitted": 0, "failed": 0}
+        self._inline_lock = threading.Lock()
+        # 每个视频任务点的弹窗题列表(jobid -> list), 重播时复用, 避免重复提交
+        self._inline_quiz_cache: dict[str, list[dict]] = {}
 
     def login(self, login_with_cookies=False):
         if login_with_cookies:
@@ -481,15 +491,151 @@ class Chaoxing:
             f"[{clazzId}][{userid}][{jobid}][{objectId}][{playingTime * 1000}][d_yHJ!$pdA~5][{duration * 1000}][0_{duration}]"
             .encode()).hexdigest()
 
+    # ------------------------------------------------------------- 视频弹窗题
+    def _inline_quiz_ready(self) -> bool:
+        """能不能真正做弹窗题: 至少要有一个答案来源(题库或大模型)
+
+        没有答案来源时硬着头皮提交只会瞎猜, 不如不动。
+        """
+        return self._answer_available()
+
+    def _fetch_inline_quizzes(self, session, job, headers) -> list[dict]:
+        """开播前先问一句「这个视频有哪些弹窗题」
+
+        接口会下发每道题的 `startTime`(第几秒弹)、`validationUrl`(提交地址)、
+        `resourceId` 和选项, 有了这些就不用猜提交路径 —— 地址是服务端给的。
+        """
+        if not self._inline_quiz_ready():
+            return []
+        mid = str(job.get("mid") or "")
+        if not mid:
+            logger.debug("[视频弹窗题] 任务点没有 mid, 跳过弹窗题拉取: {}", job.get("name"))
+            return []
+
+        for url in QUIZ_LIST_URLS:
+            try:
+                resp = session.get(url, params={"start": "undefined", "mid": mid},
+                                   headers=headers, timeout=8)
+                if resp.status_code != 200:
+                    logger.debug("[视频弹窗题] 拉取题目返回 {}: {}", resp.status_code, url)
+                    continue
+                payload = resp.json()
+            except Exception as exc:
+                logger.debug("[视频弹窗题] 拉取题目失败({}): {}", url, exc)
+                continue
+
+            quizzes = parse_quiz_list(payload)
+            if quizzes:
+                logger.info(
+                    "[视频弹窗题] 本视频有 {} 道弹窗题, 弹题时间: {}",
+                    len(quizzes),
+                    [format_duration(q.get("time") or 0) for q in quizzes],
+                )
+                with self._inline_lock:
+                    self.inline_quiz_stat["total"] += len(quizzes)
+                return quizzes
+        return []
+
+    def _submit_inline_quiz(self, session, quiz: dict, answer: str, headers) -> bool:
+        """提交一道弹窗题的答案
+
+        超星的做法是: `GET {域名}{validationUrl}?resourceid=...&answer=...`,
+        validationUrl 由服务端随题目下发, 不是写死的接口。
+        """
+        url = str(quiz.get("validationUrl") or "").strip()
+        if not url:
+            return False
+        if not url.lower().startswith("http"):
+            url = QUIZ_HOST.rstrip("/") + "/" + url.lstrip("/")
+
+        letter = (answer or "").strip().upper()[:1]
+        value = option_name_for_letter(quiz, letter) if letter.isalpha() else (answer or "").strip()
+        if not value:
+            return False
+        params = {"resourceid": str(quiz.get("resourceId") or ""), "answer": value}
+
+        try:
+            resp = session.get(url, params=params, headers=headers, timeout=8)
+        except Exception as exc:
+            logger.warning("[视频弹窗题] 提交答案异常: {}: {}", type(exc).__name__, exc)
+            return False
+
+        ok = resp.status_code == 200
+        logger.info(
+            "[视频弹窗题] 提交「{}」答案 {} -> {} (HTTP {})",
+            (quiz.get("title") or "")[:30], letter or "-", value, resp.status_code,
+        )
+        save_video_debug(
+            f"inline_quiz_submit_{quiz.get('id') or 'q'}.json",
+            {
+                "url": url,
+                "params": params,
+                "status": resp.status_code,
+                "response": (getattr(resp, "text", "") or "")[:800],
+            },
+        )
+        return ok
+
+    def _answer_and_submit_inline_quiz(self, session, quiz: dict, headers) -> bool:
+        """答一道弹窗题并提交, 每题只尝试一次"""
+        quiz["_done"] = True
+        answered = False
+        answer = ""
+        try:
+            report = self.answer_engine.solve_all([quiz], title="视频弹窗题")
+            answer = (quiz.get("answerField") or {}).get(f"answer{quiz.get('id') or ''}", "")
+            answered = bool(answer)
+            logger.info(
+                "[视频弹窗题] {} -> {} ({}个选项, {})",
+                (quiz.get("title") or "")[:40], answer or "<空>",
+                len(quiz.get("optionList") or []), report.summary(),
+            )
+        except Exception as exc:
+            logger.error("[视频弹窗题] 作答失败: {}: {}", type(exc).__name__, exc)
+
+        with self._inline_lock:
+            if answered:
+                self.inline_quiz_stat["answered"] += 1
+            else:
+                self.inline_quiz_stat["failed"] += 1
+
+        if not answered:
+            return False
+
+        ok = self._submit_inline_quiz(session, quiz, answer, headers)
+        with self._inline_lock:
+            if ok:
+                self.inline_quiz_stat["submitted"] += 1
+            else:
+                self.inline_quiz_stat["failed"] += 1
+        return ok
+
+    def _submit_due_inline_quizzes(self, session, quizzes: list[dict], play_time: float, headers):
+        """播放到某道题的弹题时间就作答并提交
+
+        超星只在「进度越过 startTime」时校验有没有答过这道题;
+        所以不用等弹窗, 提前一秒答完就行, 也不会卡住播放。
+        """
+        if not quizzes:
+            return
+        for quiz in quizzes:
+            if quiz.get("_done"):
+                continue
+            start = float(quiz.get("time") or 0)
+            if play_time + 0.5 < start:
+                continue
+            self._answer_and_submit_inline_quiz(session, quiz, headers)
+
     # ------------------------------------------------------------- 视频卡住诊断
-    def _capture_inline_questions(self, data) -> list[dict]:
+    def _capture_inline_questions(self, data, session=None, headers=None) -> list[dict]:
         """进度上报的响应里若带「视频内嵌题」, 就地作答并记录下来
 
         超星在需要弹题的播放位置, 会在 /multimedia/log 的响应里带上题目;
         这个弹窗不答, 视频会停在原地, 服务端也不会把任务点判为通过 ——
         现象就是「进度到片尾了, isPassed 还是 false」。
 
-        这里只负责识别 + 作答 + 留证据, 不去盲猜提交接口(猜错会污染账号状态)。
+        这里负责识别 + 作答; 如果响应里带着提交地址(validationUrl)就顺手提交,
+        没有就交给开播前的 initdata 流程按弹题时间提交 —— 不盲猜接口路径。
         """
         try:
             questions = find_inline_questions(data)
@@ -528,6 +674,19 @@ class Chaoxing:
                 "answer": (q.get("answerField") or {}).get(f"answer{qid}", ""),
             })
         logger.warning("[视频弹窗题] 题目与答案: {}", answers)
+
+        # 响应里如果同时带了下发的提交地址, 就顺手提交掉;
+        # 没带也没关系 —— 开播前那次 initdata 已经拿到题目并会按时间提交。
+        if session is not None:
+            for q in fresh:
+                if q.get("_done") or not q.get("validationUrl"):
+                    continue
+                answer = (q.get("answerField") or {}).get(f"answer{q.get('id') or ''}", "")
+                if not answer:
+                    continue
+                q["_done"] = True
+                self._submit_inline_quiz(session, q, answer, headers)
+
         save_video_debug(
             f"inline_quiz_{int(time.time())}.json",
             {"report": report_summary, "answers": answers, "raw": data},
@@ -678,7 +837,7 @@ class Chaoxing:
                     logger.trace(resp.text)
                     self._last_video_resp = resp.text
                     data = resp.json()
-                    self._capture_inline_questions(data)
+                    self._capture_inline_questions(data, _session, headers)
                     return data["isPassed"], 200
                 # elif resp.ok:
                 #    # TODO: 处理验证码
@@ -697,7 +856,7 @@ class Chaoxing:
             logger.trace(resp.text)
             self._last_video_resp = resp.text
             data = resp.json()
-            self._capture_inline_questions(data)
+            self._capture_inline_questions(data, _session, headers)
             return data["isPassed"], 200
 
         elif resp.status_code == 403:
@@ -766,6 +925,44 @@ class Chaoxing:
 
     def study_video(self, _course, _job, _job_info, _speed: float = 1.0,
                     _type: Literal["Video", "Audio"] = "Video") -> StudyResult:
+        """看视频: 先按现有进度播, 播完服务端不认账就从头再播一遍
+
+        超星的任务点有「必须完整、连续看完」的校验: 上一次运行留下的
+        playTime 可能让服务端认为「进度不对」, 于是进度推到片尾也不给通过。
+        以往的做法是直接跳过(任务点一直空着), 现在改成从头重播一次 ——
+        这比跳到下一节更有用, 代价只是多花一遍视频时长。
+        """
+        result, stuck = self._study_video_once(
+            _course, _job, _job_info, _speed, _type, restart_from_zero=False
+        )
+        if result == StudyResult.SUCCESS or not stuck:
+            return result
+        if runtime_budget.should_stop():
+            logger.warning("任务点未完成, 但已到运行时长上限, 本次不重播: {}", _job.get("name"))
+            return result
+
+        logger.warning(
+            "任务点未完成({}), 按「未完成就从头看」的策略忽略已记录进度, 从 0 秒重新播放: {}",
+            result.name, _job.get("name"),
+        )
+        replayed, _ = self._study_video_once(
+            _course, _job, _job_info, _speed, _type, restart_from_zero=True
+        )
+        if replayed == StudyResult.SUCCESS:
+            logger.info("从头重播后任务点已完成: {}", _job.get("name"))
+        else:
+            logger.error("从头重播后仍未完成, 本次放弃该任务点: {} ({})", _job.get("name"), replayed.name)
+        return replayed
+
+    def _study_video_once(self, _course, _job, _job_info, _speed: float = 1.0,
+                          _type: Literal["Video", "Audio"] = "Video",
+                          restart_from_zero: bool = False) -> tuple[StudyResult, bool]:
+        """单次播放尝试
+
+        Returns:
+            (结果, 是否属于「任务点卡住」)。第二个值决定要不要从头重播:
+            只有「进度推不动 / 到片尾不认账」才值得重播, 403、超时跳过不重播。
+        """
         _session = SessionManager.get_session()
 
         headers = gc.VIDEO_HEADERS if _type == "Video" else gc.AUDIO_HEADERS
@@ -774,7 +971,7 @@ class Chaoxing:
 
         if _video_info["status"] != "success":
             logger.error(f"Unknown status: {_video_info['status']}")
-            return StudyResult.ERROR
+            return StudyResult.ERROR, False
 
         _dtoken = _video_info["dtoken"]
 
@@ -785,41 +982,68 @@ class Chaoxing:
         # Time in the video (can be scaled with the speed factor): duration, play_time, last_log_time, wait_time
 
         duration = int(_video_info["duration"])
-        play_time = int(_job["playTime"]) // 1000
+        recorded_play_time = int(_job["playTime"]) // 1000
+        if restart_from_zero:
+            play_time = 0
+            if recorded_play_time:
+                logger.info(
+                    "重播模式: 忽略已记录的进度 {}s, 从 0 开始: {}",
+                    recorded_play_time, _job['name'],
+                )
+        else:
+            play_time = recorded_play_time
         wait_time = int(random.uniform(30, 90))
 
         logger.info(f"开始任务: {_job['name']}, 总时长: {duration}s, 已进行: {play_time}s")
 
+        # 弹窗题: 开播前先拿到题目和提交地址, 播到弹题时间就答并提交,
+        # 不用等它真的弹出来把播放卡住。
+        # 按 jobid 缓存: 从头重播时复用同一份列表, 已答过的题不会重复提交、重复花钱。
+        quiz_cache = getattr(self, "_inline_quiz_cache", None)
+        if quiz_cache is None:
+            quiz_cache = {}
+            self._inline_quiz_cache = quiz_cache
+        quiz_key = str(_job.get("jobid") or _job.get("objectid") or "")
+        inline_quizzes = quiz_cache.get(quiz_key)
+        if inline_quizzes is None:
+            inline_quizzes = self._fetch_inline_quizzes(_session, _job, headers)
+            quiz_cache[quiz_key] = inline_quizzes
+        if inline_quizzes:
+            self._submit_due_inline_quizzes(_session, inline_quizzes, play_time, headers)
+
         forbidden_retry = 0
         max_forbidden_retry = 2
+        passed = False
 
-        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration,
-                                                _type, headers=headers, _isdrag=4)
-        if passed:
-            logger.info("任务瞬间完成: {}", _job['name'])
-            return StudyResult.SUCCESS
+        # 冲刺探测: 上报一个"已到片尾"的进度, 服务端认了就直接结束。
+        # 重播模式下要真播一遍, 不能再用这一招, 否则等于自欺欺人。
+        if not restart_from_zero:
+            passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
+                                                    duration, _type, headers=headers, _isdrag=4)
+            if passed:
+                logger.info("任务瞬间完成: {}", _job['name'])
+                return StudyResult.SUCCESS, False
 
-        # 起点就已经在片尾(playTime >= duration)但服务端不认通过。
-        # 旧实现在这种情况下会死循环: play_time == duration 让上报条件永远成立,
-        # 而 play_time 又不可能再增长, 于是无 sleep 地疯狂刷接口, 直到 job 超时。
-        # 这里先限次重试(服务端状态偶尔延迟), 仍然不认就明确放弃。
-        if play_time >= duration:
-            for attempt in range(1, STUCK_END_RETRY + 1):
-                time.sleep(random.uniform(5, 10))
-                passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration,
-                                                       _type, headers=headers, _isdrag=4)
-                if passed:
-                    logger.info("任务瞬间完成(第{}次重试): {}", attempt, _job['name'])
-                    return StudyResult.SUCCESS
-                if state not in (200, 403):
-                    break
-            logger.error(
-                "任务点进度已到片尾但仍未通过: {} (已进行 {} / 总时长 {})。"
-                "本次跳过该任务点, 不再空转。",
-                _job['name'], format_duration(play_time), format_duration(duration),
-            )
-            self._diagnose_stuck_video(_job, _video_info, "进度到片尾但服务端不认通过")
-            return StudyResult.SKIPPED
+            # 起点就已经在片尾(playTime >= duration)但服务端不认通过。
+            # 旧实现在这种情况下会死循环: play_time == duration 让上报条件永远成立,
+            # 而 play_time 又不可能再增长, 于是无 sleep 地疯狂刷接口, 直到 job 超时。
+            # 这里先限次重试(服务端状态偶尔延迟), 仍然不认就交给外层从头重播。
+            if play_time >= duration:
+                for attempt in range(1, STUCK_END_RETRY + 1):
+                    time.sleep(random.uniform(5, 10))
+                    passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken,
+                                                            duration, duration, _type, headers=headers, _isdrag=4)
+                    if passed:
+                        logger.info("任务瞬间完成(第{}次重试): {}", attempt, _job['name'])
+                        return StudyResult.SUCCESS, False
+                    if state not in (200, 403):
+                        break
+                logger.error(
+                    "任务点进度已到片尾但仍未通过: {} (已进行 {} / 总时长 {})。",
+                    _job['name'], format_duration(play_time), format_duration(duration),
+                )
+                self._diagnose_stuck_video(_job, _video_info, "进度到片尾但服务端不认通过")
+                return StudyResult.SKIPPED, True
 
         # 倍速统一由 api/playback.py 钉死为 1.0, 外部传入的 _speed 一律忽略
         _speed = FORCED_SPEED
@@ -832,7 +1056,7 @@ class Chaoxing:
             if not acquired:
                 # 排队期间到达运行时长上限: 这个视频本次不做, 下次运行会重新检测
                 logger.info("已达单次运行时长上限, 本次跳过该视频: {}", _job['name'])
-                return StudyResult.SKIPPED
+                return StudyResult.SKIPPED, False
 
             last_iter = time.time()
             play_started_at = last_iter
@@ -854,7 +1078,7 @@ class Chaoxing:
                         if state == 403:
                             if forbidden_retry >= max_forbidden_retry:
                                 logger.warning("403重试失败, 跳过当前任务")
-                                return StudyResult.FORBIDDEN
+                                return StudyResult.FORBIDDEN, False
                             forbidden_retry += 1
                             logger.warning(
                                 "出现403报错, 正在尝试刷新会话状态 (第{}次)",
@@ -877,7 +1101,7 @@ class Chaoxing:
                                 continue
 
                         elif not passed and state != 200:
-                            return StudyResult.ERROR
+                            return StudyResult.ERROR, False
 
                         # 卡死检测: 进度一点没动、服务端也一直不认通过, 说明这个任务点
                         # 靠上报推不动了(弹窗题未做/服务端状态异常), 继续刷只是打爆接口。
@@ -898,7 +1122,7 @@ class Chaoxing:
                                         _job, _video_info,
                                         f"连续 {stall_count} 次上报进度无变化",
                                     )
-                                    return StudyResult.SKIPPED
+                                    return StudyResult.SKIPPED, True
 
                         wait_time = int(random.uniform(30, 90))
                         last_log_time = play_time
@@ -909,6 +1133,8 @@ class Chaoxing:
                     dt = (time.time() - last_iter) * _speed
                     last_iter = time.time()
                     play_time = min(duration, play_time + dt)
+                    # 播放进度越过某道弹窗题的弹题时间, 就地答掉并提交
+                    self._submit_due_inline_quizzes(_session, inline_quizzes, play_time, headers)
 
                     pbar.n = int(play_time)
                     pbar.refresh()
@@ -933,7 +1159,7 @@ class Chaoxing:
                     format_duration(wall_clock), format_duration(remaining),
                 )
 
-        return StudyResult.SUCCESS
+        return StudyResult.SUCCESS, False
 
     def study_document(self, _course, _job) -> StudyResult:
         """

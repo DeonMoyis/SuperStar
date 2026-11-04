@@ -18,11 +18,19 @@ import json
 from typing import Any
 
 # 题干字段候选(按优先级)
-_TITLE_KEYS = ("title", "question", "content", "stem", "qtitle", "name")
+_TITLE_KEYS = ("title", "question", "content", "stem", "qtitle", "name", "description")
 # 选项字段候选
 _OPTION_KEYS = ("options", "option", "choices", "optionList")
 # 题型字段候选
 _TYPE_KEYS = ("type", "questionType", "qtype", "question_type")
+
+# 拉取「本视频有哪些弹窗题」的接口, 新老两版都试一次
+QUIZ_LIST_URLS = (
+    "https://mooc1.chaoxing.com/mooc-ans/richvideo/initdatawithviewerV2",
+    "https://mooc1.chaoxing.com/mooc-ans/richvideo/initdatawithviewer",
+)
+# 提交答案时的域名(validationUrl 是相对路径, 由服务端下发, 不写死具体路径)
+QUIZ_HOST = "https://mooc1.chaoxing.com"
 
 # 已知题型 -> 归一化
 _TYPE_ALIASES = {
@@ -79,35 +87,123 @@ def _looks_like_question(node: Any) -> bool:
 
 
 def _normalize_question(node: dict) -> dict:
-    options = ""
+    raw_options = None
     for k in _OPTION_KEYS:
         v = node.get(k)
         if isinstance(v, str) and v.strip():
-            options = v.strip()
+            raw_options = v.strip()
             break
         if isinstance(v, list) and v:
-            options = "\n".join(str(x) for x in v)
+            raw_options = v
             break
+
+    options = ""
+    option_list: list[dict] = []
+    if isinstance(raw_options, str):
+        options = raw_options
+        option_list = [
+            {"name": line.strip()[:1], "description": line}
+            for line in raw_options.split("\n") if line.strip()
+        ]
+    elif isinstance(raw_options, list):
+        parts = []
+        for idx, item in enumerate(raw_options):
+            if isinstance(item, dict):
+                name = str(item.get("name") or chr(65 + idx))
+                desc = str(item.get("description") or item.get("content") or "")
+                option_list.append({"name": name, "description": desc})
+                parts.append(f"{name}.{desc}" if desc else name)
+            else:
+                name = chr(65 + idx)
+                option_list.append({"name": name, "description": str(item)})
+                parts.append(f"{name}.{item}")
+        options = "\n".join(parts)
 
     qtype = _normalize_type(_first_str(node, _TYPE_KEYS))
     if not qtype:
         qtype = "single" if options else "judgement"
 
-    pop_time = node.get("time") or node.get("startTime") or node.get("popTime")
+    pop_time = node.get("startTime")
+    if pop_time is None:
+        pop_time = node.get("time") or node.get("popTime")
     try:
         pop_time = float(pop_time) if pop_time is not None else None
     except (TypeError, ValueError):
         pop_time = None
 
     return {
-        "id": str(node.get("id") or node.get("questionId") or ""),
+        "id": str(node.get("id") or node.get("questionId") or node.get("resourceId") or ""),
         "title": _first_str(node, _TITLE_KEYS),
         "options": options,
         "type": qtype,
         "time": pop_time,
+        # 提交答案要用的字段, 由服务端下发, 不同课程版本路径不一样,
+        # 所以这里原样保留而不是拼一个固定 URL
+        "validationUrl": str(node.get("validationUrl") or node.get("validateUrl") or ""),
+        "resourceId": str(node.get("resourceId") or node.get("resourceid") or ""),
+        "optionList": option_list,
         # 与章节测验保持同一套结构, 好直接丢给 AnswerEngine
         "answerField": {},
     }
+
+
+def option_name_for_letter(quiz: dict, letter: str) -> str:
+    """把 A/B/C 换成服务端认的选项 name
+
+    弹窗题的选项提交的是 `name` 字段(不是字母), 大多数情况下它也正好是 "A"/"B",
+    但有的课程下发的是选项 id, 所以按顺序取, 别直接拿字母去提交。
+    """
+    letter = (letter or "").strip().upper()[:1]
+    options = quiz.get("optionList") or []
+    if letter:
+        for item in options:
+            if str(item.get("name", "")).strip().upper() == letter:
+                return str(item["name"]).strip()
+    if len(letter) == 1:
+        idx = ord(letter) - 65
+        if 0 <= idx < len(options):
+            name = str(options[idx].get("name") or "").strip()
+            if name:
+                return name
+    return letter
+
+
+def parse_quiz_list(payload: Any) -> list[dict]:
+    """解析 initdatawithviewer(V2) 的响应, 拿出弹窗题列表
+
+    响应形如 `[{"datas": [ {startTime, validationUrl, resourceId, options: [...]}, ... ]}]`,
+    外层偶尔是字典而不是列表, 两种都兼容。按弹题时间升序返回。
+    """
+    if isinstance(payload, dict):
+        payload = [payload]
+    if not isinstance(payload, list):
+        return []
+
+    quizzes: list[dict] = []
+    seen: set[str] = set()
+    for group in payload:
+        if not isinstance(group, dict):
+            continue
+        datas = group.get("datas")
+        if not isinstance(datas, list):
+            continue
+        for raw in datas:
+            if not isinstance(raw, dict):
+                continue
+            quiz = _normalize_question(raw)
+            if not quiz["title"] and not quiz["options"]:
+                continue
+            if not quiz["validationUrl"]:
+                # 没有提交地址的条目(有时是讲义/资料), 做了也提交不了, 直接跳过
+                continue
+            key = quiz["id"] or quiz["title"][:80]
+            if key in seen:
+                continue
+            seen.add(key)
+            quizzes.append(quiz)
+
+    quizzes.sort(key=lambda item: item.get("time") or 0.0)
+    return quizzes
 
 
 def find_inline_questions(raw_card: Any, max_depth: int = 6) -> list[dict]:
