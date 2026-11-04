@@ -205,11 +205,12 @@ Actions 页面上有两个地方，别搞混：
 | `MAX_RUNTIME_MINUTES` | 数字 | `110` | 单次最多跑多少分钟，到点收尾退出 |
 | `ANSWER_SUBMIT` | `auto` / `always` / `never` | `auto` | 答题后提交策略，见 [作业与考试](#作业与考试) |
 | `AUTO_ANSWER` | `true` / `false` | 有 Key 就 `true` | 是否做作业/考试 |
-| `ANSWER_EXAM` | `true` / `false` | `true` | **是否让程序代考**，设 `false` 只做作业 |
+| `ANSWER_EXAM` | `true` / `false` | `false` | **是否让程序代考**，默认不代考，设 `true` 才做考试 |
 | `ANSWER_ORDER` | `after` / `before` / `both` | `after` | 作业和刷课谁先做，见 [作业与考试](#作业与考试) |
 | `VIDEO_DEBUG` | `true` / `false` | `false` | 排查「视频刷不过去」时设 `true`，诊断数据存到 `video_debug/` |
+| `SKIP_FACE_CAPTURE` | `true` / `false` | `true` | 开了人脸采集的视频直接跳过（纯 HTTP 做不过去）；设 `false` 可强制照常播一遍以确认是否误判 |
 
-`ANSWER_EXAM = false` 是为了这种情况：考试通常是「学完一定进度才解锁」的，而且**次数有限、交了就改不了**。你可能希望作业交给程序，考试自己考。设成 `false` 后，程序会跳过考试列表，作业照做。
+**考试默认不代考。** 考试通常要「学完一定进度才解锁」，而且**次数有限、交了就改不了** —— 所以默认跳过考试列表，只做作业 + 章节测验 + 任务点，考试留给你自己考。想让程序代考就设 `ANSWER_EXAM = true`（或命令行 `--exam`）。
 
 > 手动触发时还有一个 `max_runtime` 输入框，只影响这一次，优先级高于 `MAX_RUNTIME_MINUTES`。
 
@@ -227,7 +228,7 @@ Actions 页面上有两个地方，别搞混：
 2. 从 Secrets 读出账号密码，作为环境变量传给程序
 3. 程序登录学习通，拉课程列表
 4. 刷这门课的视频/文档，每小节先看完内容，再做本节测验（视频 1 倍速串行）
-5. 再处理这门课的作业 + 考试（除非设了 ANSWER_EXAM=false）
+5. 再处理这门课的作业（考试默认不做，除非设了 ANSWER_EXAM=true）
 6. 这门课收工，进入下一门课
 7. 到达时长上限 → 收尾退出 → job 结束
 ```
@@ -251,9 +252,9 @@ Actions 页面上有两个地方，别搞混：
          │       · 视频：1 倍速真实播放，走完全程才上报完成
          │       · 章节测验：题库/AI 搜题 → 覆盖率达标才提交
          │
-         └─ 拉作业列表 + 考试列表
+         └─ 拉作业列表（考试默认不代考，设 ANSWER_EXAM=true 才会拉考试列表）
              ├─ 逐条判断状态（未交/未开始才处理，已完成/已批阅跳过）
-             ├─ 考试默认排在作业前面
+             ├─ 开了考试时，考试排在作业前面
              ├─ 打开发题页，自动点「开始考试」/「继续作答」
              ├─ 解析题目（含超星字体加密解密）
              ├─ 逐题作答：题库 → AI → 随机兜底
@@ -324,15 +325,15 @@ Actions 页面上有两个地方，别搞混：
 
 **作业**：一般可以补交，交给程序通常没坏处。
 
-**考试**：情况不一样 —— 通常要学完一定进度才解锁，次数有限，交卷后不能改。所以是否代考由你决定：
+**考试默认不代考**：考试通常要学完一定进度才解锁，次数有限，交卷后不能改。默认只做「视频 + 章节测验 + 作业 + 任务点」，考试留给你自己：
 
 ```bash
---no-exam      # 只做作业，考试自己考
---exam         # 考试也让程序做
-（都不写）      # 跟随配置文件 [answer] exam
+（都不写）      # 默认不代考，只做作业
+--exam         # 连考试一起做
+--no-exam      # 显式只做作业（和默认一致）
 ```
 
-在 Actions 里对应 `ANSWER_EXAM = false`。
+在 Actions 里对应 `ANSWER_EXAM = true`（设了才代考）。
 
 另外两个和安全相关的机制：
 
@@ -385,13 +386,13 @@ python main.py -c config.ini
 常用组合：
 
 ```bash
-# 刷课 + 顺手做作业和考试
+# 刷课 + 顺手做作业(考试默认不代考)
 python main.py -c config.ini --auto-answer
 
 # 期末冲刺：只做题，不刷视频
 python main.py -c config.ini --answer-only
 
-# 只做作业，考试自己考
+# 只做作业，考试自己考（= 默认行为）
 python main.py -c config.ini --auto-answer --no-exam
 
 # 先只填不交，人工检查答案
@@ -427,6 +428,9 @@ docker run -d --name superstar \
 | `jobs` | 同时处理的章节数（视频仍串行） | `1` |
 | `max_runtime_minutes` | 单次运行时长上限，`0` = 不限 | `0` |
 | `notopen_action` | 章节未开放时 `retry` 重试 / `continue` 跳过 | `retry` |
+| `skip_face_capture` | 开了人脸采集的视频直接跳过（纯 HTTP 做不过去） | `true` |
+| `skip_registry` | 把「哪个任务点过不去、为什么」落盘，跨运行有效 | `true` |
+| `skip_registry_file` | 记录簿文件名 | `skip_registry.json` |
 
 ### `[tiku]` 题库
 
@@ -476,7 +480,7 @@ provider = TikuGo,DeepSeek
 | --- | --- | --- |
 | `enable` | 总开关，等价于 `--auto-answer` | `false` |
 | `work` | 是否处理作业 | `true` |
-| `exam` | **是否处理考试**，等价于 `--exam` / `--no-exam` | `true` |
+| `exam` | **是否处理考试**，默认不代考，等价于 `--exam` / `--no-exam` | `false` |
 | `order` | 作业和刷课谁先做：`before` / `after` / `both`，默认先把本节视频看完再做题 | `after` |
 | `submit_policy` | `auto` / `always` / `never`（作业、考试、章节测验共用） | `auto` |
 | `min_cover_rate` | `auto` 模式的最低覆盖率 | `0.9` |
@@ -506,13 +510,15 @@ python main.py --help
 | `-j, --jobs` | 并行章节数，默认 1 |
 | `--max-runtime` | 单次运行时长上限（分钟） |
 | `-v, --verbose` | 输出 DEBUG 日志 |
-| `--auto-answer` | 刷完课顺便做作业和考试 |
+| `--auto-answer` | 刷完课顺便做作业（考试默认不代考） |
 | `--answer-only` | 只做题，不刷视频 |
 | `--answer-submit` | `auto` / `always` / `never` |
 | `--answer-order` | `after` / `before` / `both`：作业和刷课谁先做 |
-| `--exam` / `--no-exam` | **是否处理考试** |
+| `--exam` / `--no-exam` | **是否处理考试**（默认不考） |
 | `--answer-debug` | 保存原始页面，排查解析问题 |
 | `--video-debug` | 保存卡住视频的卡片/状态/响应，排查「刷不过去」 |
+| `--skip-face-capture` / `--no-skip-face-capture` | 开了人脸采集的视频是否直接跳过（默认跳过） |
+| `--skip-registry` | 跳过记录簿路径，默认 `skip_registry.json` |
 | `--deepseek-key` | DeepSeek Key |
 | `--ai-model` | 模型名，默认 `deepseek-flash` |
 | `--ai-mode` | `fallback` / `priority` / `off` |
@@ -528,9 +534,30 @@ python main.py --help
 
 1. **先看视频**（音频 / 文档同理），这一节的内容任务点全部走完，才进入本章的测验 / 作业；
 2. 视频中途弹出的题（弹窗题）不会被漏掉：开播前就取到题目和提交地址，播放进度走到弹题时间时**自动作答并提交**，不用等它弹出来把播放卡住；
-3. 视频播到片尾、服务端却不认账（`isPassed` 仍是 `false`）时，程序会**忽略已记录的进度，从 0 秒重新播一遍**；重播还不行才放弃，并记进结尾的「需人工处理的视频任务点」。
+3. 视频播到片尾、服务端却不认账（`isPassed` 仍是 `false`）时，程序会**忽略已记录的进度，从 0 秒重新播一遍**；重播还不行才放弃，并记进结尾的「本次未完成 / 已跳过的任务点」；
+4. **开了人脸采集的视频直接跳过**，不播放也不重播 —— 这类视频的进度推到片尾服务端也不认，纯 HTTP 永远做不过去，硬刷只是把一次运行的时长全烧在一个任务点上。跳过它，本节测验照做，下一节照常进行。
 
 想换顺序：`[answer] order = before` 改成先做题再刷课，`both` 表示刷课前后各扫一遍。
+
+## 跳过记录：为什么跳过、下次还试不试
+
+Actions 会被中断后重开，日志也翻不完 —— 所以「哪个任务点过不去、为什么」必须落到文件里，程序和你都能记住。
+
+程序会把每个没做完的任务点写进 `skip_registry.json`（`[common] skip_registry`）：
+
+| 原因码 | 什么情况 | 下次运行 |
+| --- | --- | --- |
+| `face_capture` | 视频开了人脸采集，必须本人过人脸 | **直接跳过，不再尝试**（重试也不会变） |
+| `forbidden` | 上报进度一直被 403，多为风控 / 会话失效 | 照常重试 |
+| `server_reject` | 进度到片尾但服务端不认通过 | 照常重试 |
+| `inline_quiz` | 视频内弹窗题没做对 | 照常重试 |
+| `runtime_budget` | 这次到时长上限了 | 下次接着做 |
+
+只有 `face_capture` 会被标成「永久跳过」—— 因为它不是运气问题，是能力边界。其余原因都只是记录，下次仍然会试。
+
+在 Actions 里这份记录由 `actions/cache` 保存，跨运行自动累积；每次运行结束时还会写一份 **Step Summary**（Actions 页面直接可见），列出跳过了哪些任务点、为什么跳过，不用去翻日志。
+
+想确认是不是误判（比如其实是风控被人脸检测误伤），把 `SKIP_FACE_CAPTURE` 设成 `false`（命令行 `--no-skip-face-capture`）跑一次，让它照常播一遍看真实响应即可。
 
 ---
 
@@ -605,6 +632,8 @@ SuperStar/
 │   ├── decode.py            # 页面解析（题目、章节、任务点）
 │   ├── playback.py          # 播放/作答节奏：1 倍速 + 播放位/作答位
 │   ├── runtime_budget.py    # 单次运行时长上限（时间盒）
+│   ├── skip_registry.py     # 任务点跳过记录簿：为什么跳过、下次还试不试
+│   ├── video_quiz.py        # 视频内弹窗题：解析、选项映射、提交
 │   ├── font_decoder.py      # 超星字体加密解密
 │   ├── notification.py      # 外部通知
 │   └── live.py / live_process.py
@@ -614,17 +643,22 @@ SuperStar/
 
 ### 本地自测
 
-四个测试全部**离线**，用假的 HTTP 响应跑完整链路，不需要登录也不需要 API Key：
+九个测试全部**离线**，用假的 HTTP 响应跑完整链路，不需要登录也不需要 API Key：
 
 ```bash
 pip install -r requirements.txt
 python tests/test_auto_answer.py     # 列表解析 / 作答匹配 / 提交策略 / 考试开关
-python tests/test_ai_solver.py       # JSON 解析 / 字母纠错 / 缓存 / 重试
+python tests/test_ai_solver.py       # JSON 解析 / 字母纠错 / 缓存 / 深度思考参数
+python tests/test_chapter_order.py   # 章节内顺序：先内容，再本节测验
+python tests/test_skip_registry.py   # 人脸采集直接跳过 / 跳过记录跨运行生效
+python tests/test_video_quiz.py      # 弹窗题解析 / 选项映射 / 到点提交
+python tests/test_study_work.py      # 章节测验接入大模型、提交策略
+python tests/test_stuck_task.py      # 片尾不通过不空转、从头重播且只重播一次（约 15 秒）
 python tests/test_playback.py        # 倍速强制 / 播放位与作答位互斥（约 15 秒）
 python tests/test_runtime_budget.py  # 时长上限 / 到点跳过 / 不卡死（约 10 秒）
 ```
 
-改完解析逻辑或提示词后先跑一遍，确认没把已有功能改坏。后两个会真的等时间，慢是正常的。
+改完解析逻辑或提示词后先跑一遍，确认没把已有功能改坏。最后三个会真的等时间，慢是正常的。
 
 ---
 

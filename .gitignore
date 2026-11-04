@@ -161,3 +161,10 @@ answer_debug/
 # AI 答题答案缓存（本地生成，不要提交）
 ai_cache.json
 ai_cache_test.json
+
+# 任务点跳过记录簿（本地运行时生成；Actions 里由 cache 保存，不进仓库）
+skip_registry.json
+skip_registry.json.tmp
+
+# 视频诊断数据（--video-debug 生成）
+video_debug/

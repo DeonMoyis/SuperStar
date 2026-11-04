@@ -189,7 +189,8 @@ def test_pipeline():
         course = {"courseId": "111", "clazzId": "222", "cpi": "555", "title": "测试课程"}
 
         # 场景1: 覆盖率达标 -> 自动提交
-        answer = AutoAnswer(chaoxing, {"enable": True, "submit_policy": "auto", "min_cover_rate": 0.5})
+        answer = AutoAnswer(chaoxing, {"enable": True, "submit_policy": "auto",
+                                       "min_cover_rate": 0.5, "exam": True})
         stats = answer.run_course(course)
         assert stats.tasks_found == 4, stats.tasks_found          # 2 份作业 + 2 份考试
         assert stats.answered == 2, f"应只作答未完成的那 2 份, 实际 {stats.answered}"
@@ -206,7 +207,8 @@ def test_pipeline():
         # 场景2: 覆盖率不达标 -> 只保存
         fake_session.posted.clear()
         empty_tiku = FakeTiku(answers={})
-        low = AutoAnswer(chaoxing, {"enable": True, "submit_policy": "auto", "min_cover_rate": 1.01})
+        low = AutoAnswer(chaoxing, {"enable": True, "submit_policy": "auto",
+                                    "min_cover_rate": 1.01, "exam": True})
         low.engine.tiku = empty_tiku
         stats_low = low.run_course(course)
         assert stats_low.saved == 2 and stats_low.submitted == 0
@@ -217,10 +219,19 @@ def test_pipeline():
 
         # 场景3: never 策略 -> 无论覆盖率都只保存
         fake_session.posted.clear()
-        never = AutoAnswer(chaoxing, {"enable": True, "submit_policy": "never"})
+        never = AutoAnswer(chaoxing, {"enable": True, "submit_policy": "never", "exam": True})
         stats_never = never.run_course(course)
         assert stats_never.submitted == 0 and stats_never.saved == 2
         print("[ok] 只保存策略:", stats_never.summary())
+
+        # 场景4: 默认不代考 -> 只扫到作业, 考试完全不碰
+        fake_session.posted.clear()
+        work_only = AutoAnswer(chaoxing, {"enable": True, "submit_policy": "auto"})
+        stats_work = work_only.run_course(course)
+        assert stats_work.tasks_found == 2, f"默认应只发现 2 份作业, 实际 {stats_work.tasks_found}"
+        kinds = ["考试" if "exam" in url else "作业" for url, _ in fake_session.posted]
+        assert all(k == "作业" for k in kinds), f"默认不该提交考试, 实际 {kinds}"
+        print("[ok] 默认不代考:", stats_work.summary())
     finally:
         SessionManager.get_session = original
 
@@ -232,6 +243,7 @@ def test_config():
     assert config["submit_policy"] == "auto", "非法策略应回退为 auto"
     assert normalize_answer_config(None)["enable"] is False
     # 考试相关的两个新配置
+    assert normalize_answer_config(None)["exam"] is False, "默认不代考(考试留给用户自己考)"
     assert normalize_answer_config(None)["exam_priority"] is True, "默认应考试优先"
     assert normalize_answer_config(None)["exam_min_remaining"] == 15
     custom = normalize_answer_config({"exam_priority": "false", "exam_min_remaining": "30"})
@@ -250,7 +262,7 @@ def test_exam_priority_order():
         chaoxing = Chaoxing(account=None, tiku=FakeTiku())
         course = {"courseId": "111", "clazzId": "222", "cpi": "555", "title": "排序课程"}
 
-        answer = AutoAnswer(chaoxing, {"enable": True, "submit_policy": "always"})
+        answer = AutoAnswer(chaoxing, {"enable": True, "submit_policy": "always", "exam": True})
         answer.run_course(course)
         kinds = ["考试" if "exam" in url else "作业" for url, _ in fake_session.posted]
         assert kinds == ["考试", "作业"], f"应考试在前, 实际 {kinds}"
@@ -259,7 +271,8 @@ def test_exam_priority_order():
         # 关掉优先时应恢复列表顺序(作业在前)
         fake_session.posted.clear()
         normal = AutoAnswer(
-            chaoxing, {"enable": True, "submit_policy": "always", "exam_priority": "false"}
+            chaoxing,
+            {"enable": True, "submit_policy": "always", "exam": True, "exam_priority": "false"},
         )
         normal.run_course(course)
         kinds = ["考试" if "exam" in url else "作业" for url, _ in fake_session.posted]
@@ -284,7 +297,8 @@ def test_exam_start_blocked_by_remaining_time():
         course = {"courseId": "111", "clazzId": "222", "cpi": "555", "title": "时间不足"}
 
         answer = AutoAnswer(
-            chaoxing, {"enable": True, "submit_policy": "always", "exam_min_remaining": 15}
+            chaoxing,
+            {"enable": True, "submit_policy": "always", "exam": True, "exam_min_remaining": 15},
         )
         stats = answer.run_course(course)
         kinds = ["考试" if "exam" in url else "作业" for url, _ in fake_session.posted]
@@ -299,7 +313,8 @@ def test_exam_start_blocked_by_remaining_time():
         fake_session.posted.clear()
         runtime_budget.configure(5)
         eager = AutoAnswer(
-            chaoxing, {"enable": True, "submit_policy": "always", "exam_min_remaining": 0}
+            chaoxing,
+            {"enable": True, "submit_policy": "always", "exam": True, "exam_min_remaining": 0},
         )
         stats_eager = eager.run_course(course)
         assert stats_eager.postponed == 0 and stats_eager.answered == 2

@@ -2,6 +2,7 @@
 import argparse
 import configparser
 import enum
+import os
 import sys
 import threading
 import time
@@ -30,6 +31,12 @@ from api.live import Live
 from api.live_process import LiveProcessor
 from api.playback import FORCED_SPEED, normalize_speed, playback_gate
 from api.runtime_budget import runtime_budget
+from api.skip_registry import (
+    DEFAULT_REGISTRY_FILE,
+    configure_default_registry,
+    get_default_registry,
+    release_default_registry,
+)
 
 class ChapterResult(enum.Enum):
     SUCCESS=0,
@@ -129,11 +136,23 @@ def parse_args():
         "--video-debug", action="store_true",
         help="视频刷不过去时, 把卡片/状态/上报响应存到 video_debug/ 目录, 用于定位原因"
     )
+    # 人脸采集视频: 纯 HTTP 永远做不过去(进度到片尾也不认), 默认直接跳过不浪费时间。
+    # 如果怀疑是误判(其实是别的原因), 可以用 --no-skip-face-capture 强制照常播放对比。
+    parser.add_argument(
+        "--skip-face-capture", dest="skip_face_capture",
+        action=argparse.BooleanOptionalAction, default=None,
+        help="检测到视频开启人脸采集时直接跳过(默认开, 也读 [common] skip_face_capture); "
+             "用 --no-skip-face-capture 强制照常播放以确认是否误判"
+    )
+    parser.add_argument(
+        "--skip-registry", type=str, default=None,
+        help=f"任务点跳过记录簿路径(默认 {DEFAULT_REGISTRY_FILE}), 下次运行据此直接跳过做不过去的任务点"
+    )
     # 考试开关: 考试通常是「学完一定进度才解锁」的, 要不要考交给你决定。
-    # 不传时跟随配置文件 [answer] exam 的值。
+    # 不传时跟随配置文件 [answer] exam 的值, 而默认值是「不考」。
     parser.add_argument(
         "--exam", dest="answer_exam", action=argparse.BooleanOptionalAction, default=None,
-        help="本次处理考试; 用 --no-exam 跳过考试只做作业(考试有次数限制, 想自己考就加 --no-exam)"
+        help="本次处理考试(默认不考); 想代考加 --exam, 考试有次数限制, 自己考就维持默认"
     )
 
     # ---------------- DeepSeek AI 答题 ----------------
@@ -199,6 +218,11 @@ def load_config_from_file(config_path):
             common_config["password"] = common_config["password"].strip()
         if "verbose" in common_config:
             common_config["verbose"] = str_to_bool(common_config["verbose"])
+        # 人脸采集视频默认直接跳过(纯 HTTP 做不到, 硬刷只会白烧时长)
+        if "skip_face_capture" in common_config:
+            common_config["skip_face_capture"] = str_to_bool(common_config["skip_face_capture"])
+        if "skip_registry" in common_config:
+            common_config["skip_registry"] = str_to_bool(common_config["skip_registry"])
 
     # 检查并读取tiku节
     if config.has_section("tiku"):
@@ -265,6 +289,10 @@ def build_config_from_args(args):
         "answer": answer_config,
         "answer_order": getattr(args, "answer_order", None) or "after",
         "video_debug": getattr(args, "video_debug", False),
+        "skip_face_capture": True if getattr(args, "skip_face_capture", None) is None
+        else bool(args.skip_face_capture),
+        "skip_registry": True,
+        "skip_registry_path": getattr(args, "skip_registry", None) or DEFAULT_REGISTRY_FILE,
         "ai": ai_config,
     }
     return common_config, {}, {}
@@ -309,6 +337,17 @@ def init_config():
         if getattr(args, "ai_thinking", None) is not None:
             ai_raw["thinking"] = "true" if args.ai_thinking else "false"
         common_config["ai"] = ai_raw
+
+        # 跳过记录簿与「人脸采集视频直接跳过」的开关
+        common_config["skip_registry_path"] = (
+            getattr(args, "skip_registry", None)
+            or common_config.get("skip_registry_file")
+            or DEFAULT_REGISTRY_FILE
+        )
+        common_config.setdefault("skip_registry", True)
+        if getattr(args, "skip_face_capture", None) is not None:
+            common_config["skip_face_capture"] = bool(args.skip_face_capture)
+        common_config.setdefault("skip_face_capture", True)
         return common_config, tiku_config, notification_config
     else:
         return build_config_from_args(args)
@@ -363,6 +402,8 @@ def init_chaoxing(common_config, tiku_config, answer_config=None):
         ai_solver=solver,
         ai_mode=getattr(getattr(solver, "config", None), "mode", "fallback"),
         answer_policy=answer_config or {},
+        # 人脸采集的视频直接跳过: 纯 HTTP 做不过去, 硬刷只会把时长烧在这个任务点上
+        skip_face_capture=common_config.get("skip_face_capture", True),
     )
     
     return chaoxing
@@ -762,6 +803,54 @@ def format_time(num, suffix='', divisor=''):
     return f"{mins:02d}:{sec:02d}"
 
 
+def write_step_summary(markdown: str) -> None:
+    """把关键结论写进 GitHub Actions 的 Step Summary
+
+    只在 Actions 里生效(有 GITHUB_STEP_SUMMARY 环境变量时)。好处是运行结束后
+    在 Actions 页面上直接能看到「哪些任务点跳过了、为什么」, 不用翻几千行日志 ——
+    Actions 会被中断重开, 日志看不完的话, 人事后就记不住这个任务点是怎么回事。
+    """
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path or not markdown.strip():
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(markdown if markdown.endswith("\n") else markdown + "\n")
+    except OSError as exc:
+        logger.debug("写 Step Summary 失败: {}", exc)
+
+
+def build_step_summary(*, done_msg: str, manual_lines: list[str], inline_summary: str,
+                       answer_summary: str, registry=None) -> str:
+    """拼一段 markdown 摘要(Step Summary 用)"""
+    head = (done_msg.splitlines() or ["本次运行结束"])[0]
+    out = ["## 刷课结果", "", head, ""]
+
+    if manual_lines:
+        out += [f"### 未完成 / 已跳过 {len(manual_lines)} 个任务点", "",
+                "| 任务点 | 说明 |", "| --- | --- |"]
+        for line in manual_lines:
+            text = line.strip().lstrip("- ").strip()
+            name, _, reason = text.partition(":")
+            out.append(f"| {name.strip()} | {reason.strip().replace('|', '/')} |")
+        out += ["",
+                "> 人脸采集的任务点必须本人在网页端/App 里过人脸, 程序不会再重试;"
+                " 记录写在 `skip_registry.json`, 下次运行直接跳过。", ""]
+
+    if inline_summary:
+        out += ["### 视频弹窗题", "", inline_summary, ""]
+    if answer_summary:
+        out += ["### 答题情况", "", "```", answer_summary, "```", ""]
+    if registry is not None:
+        stats = registry.stats()
+        if stats.get("permanent"):
+            out += [f"### 已确认做不过去的任务点(共 {stats['permanent']} 个, 跨运行有效)", ""]
+            for line in registry.summary_lines(permanent_only=True)[:20]:
+                out.append(f"- {line}")
+            out.append("")
+    return "\n".join(out)
+
+
 def main():
     """主程序入口"""
     try:
@@ -787,6 +876,18 @@ def main():
 
         # 视频诊断: 卡住时把卡片/状态/上报响应落盘, 用于区分「弹窗题 / 人脸采集 / 风控」
         configure_video_debug("video_debug" if common_config.get("video_debug") else None)
+
+        # 跳过记录簿: 记录「哪个任务点为什么过不去」。
+        # permanent 条目(如人脸采集)下次运行直接跳过, 不再白播一遍视频。
+        registry_path = common_config.get("skip_registry_path") or DEFAULT_REGISTRY_FILE
+        registry = configure_default_registry(
+            registry_path, enabled=bool(common_config.get("skip_registry", True))
+        )
+        if registry is not None:
+            logger.info(
+                "[跳过记录] 使用 {}: 已有 {} 条记录, 其中 {} 条不会再重试",
+                registry.path, registry.stats()["total"], registry.stats()["permanent"],
+            )
 
         # 初始化 DeepSeek(没填 api_key 会自动关闭, 不影响其余功能)
         ai_config = normalize_ai_config(common_config.get("ai"))
@@ -835,7 +936,7 @@ def main():
             logger.info(
                 f"自动答题: 作业 {'处理' if answer_config['work'] else '跳过'} / "
                 f"考试 {'处理' if answer_config['exam'] else '跳过'} "
-                f"(考试可用 --no-exam 关闭, 或配置 [answer] exam=false)"
+                f"(考试默认不代考, 想代考用 --exam 或配置 [answer] exam=true)"
             )
         else:
             logger.info("自动答题: 未启用 (需要 --auto-answer / --answer-only 或 [answer] enable=true)")
@@ -887,24 +988,54 @@ def main():
             logger.info("所有课程学习任务已完成")
 
         # ---- 汇总 ----
-        # 卡住的视频任务点: 进度到片尾但服务端不认通过, 程序侧已经推不动了
-        stuck_summary = ""
+        # 本次没能完成的任务点: 卡住的(进度到片尾不通过) + 主动跳过的(人脸采集等)。
+        # 两者会有重叠, 按 (任务点, 原因) 去重后再打印, 免得同一件事报两遍。
         stuck_points = getattr(chaoxing, "stuck_points", None) or []
-        if stuck_points:
-            lines = []
-            for p in stuck_points:
-                line = f"  - {p.get('name')}: {p.get('reason')}"
-                if p.get("has_face_capture"):
-                    line += " (开了人脸采集, 需要本人过人脸)"
-                elif p.get("question_count"):
-                    line += f" (视频内有 {p['question_count']} 道弹窗题)"
-                lines.append(line)
-            stuck_summary = "\n".join(lines)
+        skipped_points = getattr(chaoxing, "skipped_points", None) or []
+        manual_lines: list[str] = []
+        manual_seen: set[tuple] = set()
+
+        def _add_manual(name, reason, tag: str = "") -> None:
+            key = (name, reason)
+            if key in manual_seen:
+                return
+            manual_seen.add(key)
+            line = f"  - {name}: {reason}"
+            if tag:
+                line += f" ({tag})"
+            manual_lines.append(line)
+
+        for p in stuck_points:
+            tag = ""
+            if p.get("has_face_capture"):
+                tag = "需本人过人脸, 程序不再重试"
+            elif p.get("question_count"):
+                tag = f"视频内有 {p['question_count']} 道弹窗题"
+            _add_manual(p.get("name"), p.get("reason"), tag)
+
+        skipped_summary = ""
+        if skipped_points:
+            for p in skipped_points:
+                tag = "已记入跳过记录, 下次不再重试" if p.get("permanent") else "下次运行会重试"
+                _add_manual(p.get("name"), p.get("reason"), tag)
+            skipped_summary = "\n".join(
+                f"  - {p.get('name')}: {p.get('reason')}"
+                for p in skipped_points
+            )
             logger.warning(
-                f"有 {len(stuck_points)} 个视频任务点刷不过去, 需要人工处理:\n{stuck_summary}"
+                "本次主动跳过 {} 个任务点(原因已记录, 能做的部分已继续):\n{}",
+                len({(p.get("name"), p.get("reason")) for p in skipped_points}), skipped_summary,
+            )
+
+        manual_summary = "\n".join(manual_lines)
+        if manual_lines:
+            logger.warning(
+                f"共 {len(manual_lines)} 个任务点本次未完成, 需要人工处理:\n{manual_summary}"
             )
             if common_config.get("video_debug"):
                 logger.warning("诊断数据已存到 video_debug/ 目录, 可据此确认具体原因")
+        elif not skipped_points:
+            logger.info("本次没有卡住或被跳过的任务点")
 
         # 视频弹窗题(视频中途弹出的小题)的作答/提交情况
         inline_summary = ""
@@ -940,12 +1071,23 @@ def main():
             done_msg += "\n" + answer_summary
         if inline_summary:
             done_msg += "\n" + inline_summary
-        if stuck_summary:
-            done_msg += "\n需人工处理的视频任务点:\n" + stuck_summary
+        if manual_lines:
+            done_msg += "\n本次未完成 / 已跳过的任务点:\n" + manual_summary
         done_msg += "\n" + runtime_budget.summary()
         logger.info(runtime_budget.summary())
         logger.info(done_msg)
         notification.send(done_msg)
+
+        # Actions 运行结束后, 在页面上一眼能看到的关键结论(日志太长没人翻)
+        write_step_summary(
+            build_step_summary(
+                done_msg=done_msg,
+                manual_lines=manual_lines,
+                inline_summary=inline_summary,
+                answer_summary=answer_summary,
+                registry=get_default_registry(),
+            )
+        )
 
     except SystemExit as e:
         if e.code != 0:
@@ -964,6 +1106,8 @@ def main():
     finally:
         # 把 AI 答案缓存落盘, 下次同样的题目直接命中, 不用再花钱
         release_default_solver()
+        # 跳过记录簿落盘: 下次运行据此直接跳过做不过去的任务点
+        release_default_registry()
 
 
 if __name__ == "__main__":

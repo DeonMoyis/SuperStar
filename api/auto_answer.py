@@ -78,7 +78,9 @@ UNFINISHED_KEYWORDS = (
 DEFAULT_ANSWER_CONFIG = {
     "enable": False,        # 是否启用自动答题
     "work": True,           # 是否处理作业
-    "exam": True,           # 是否处理考试
+    # 考试默认不代考: 次数有限、交了不能改, 交给用户自己决定
+    # 想代考就用 --exam 或配置 [answer] exam=true
+    "exam": False,
     "submit_policy": "auto",  # auto-按覆盖率 / always-总是提交 / never-只保存
     "min_cover_rate": 0.9,  # auto 模式下的最低覆盖率
     "max_tasks": 20,        # 每门课最多处理多少份, 防止跑飞

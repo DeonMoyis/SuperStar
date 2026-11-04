@@ -42,6 +42,15 @@ from api.video_quiz import (
 from api.exceptions import MaxRetryExceeded
 from api.playback import FORCED_SPEED, answer_gate, playback_gate, format_duration
 from api.runtime_budget import runtime_budget
+from api.skip_registry import (
+    REASON_FACE_CAPTURE,
+    REASON_FORBIDDEN,
+    REASON_INLINE_QUIZ,
+    REASON_SERVER_REJECT,
+    REASON_TEXT,
+    record_skip,
+    should_skip,
+)
 
 
 def get_timestamp():
@@ -174,6 +183,36 @@ STALL_LIMIT = 3         # 连续多少次上报进度都没前进就判定卡死
 VIDEO_DEBUG_DIR: Optional[str] = None
 
 
+def has_face_capture(job: dict) -> bool:
+    """这个视频任务点是否开启了人脸采集
+
+    开了人脸采集的视频, 进度推到片尾服务端也照样不认(isPassed=false), 还会 403。
+    这是纯 HTTP 方案的硬边界 —— 不是重试能解决的问题, 所以要在播放之前就认出来,
+    直接跳过去做本节测验, 而不是把整段视频白播一遍再从头重播一遍。
+
+    开关出现在两个地方, 都要看:
+      * 任务点卡片 / 列表里的 videoFaceCaptureEnc (非空即开启)
+      * /ananas/status 响应里的 videoFaceCapture / faceCapture
+    """
+    if not isinstance(job, dict):
+        return False
+    for field in ("videoFaceCaptureEnc", "videoFaceCapture", "faceCaptureEnc"):
+        value = job.get(field)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, dict) and value:
+            return True
+    raw = job.get("raw_card")
+    if isinstance(raw, dict):
+        value = raw.get("videoFaceCaptureEnc")
+        if isinstance(value, str) and value.strip():
+            return True
+    try:
+        return bool(summarize_video_card(raw).get("has_face_capture"))
+    except Exception:  # 诊断函数不能反过来把主流程搞挂
+        return False
+
+
 def configure_video_debug(path: Optional[str]) -> None:
     """开启视频诊断数据落盘(目录), 传 None 关闭"""
     global VIDEO_DEBUG_DIR
@@ -244,6 +283,15 @@ class Chaoxing:
         self._inline_lock = threading.Lock()
         # 每个视频任务点的弹窗题列表(jobid -> list), 重播时复用, 避免重复提交
         self._inline_quiz_cache: dict[str, list[dict]] = {}
+        # 开了人脸采集的视频是否直接跳过(纯 HTTP 做不到, 硬刷只会白烧时长)
+        self.skip_face_capture = kwargs.get("skip_face_capture", True)
+        # 最近一次被判为卡住的任务点记录, study_video 用它决定「值不值得从头重播」
+        self._last_stuck: Optional[dict] = None
+        # 当前正在处理的课程名(记录跳过原因时带上, 汇总时按课程分组)
+        self._current_course: str = ""
+        # 本次运行因不可自动完成原因跳过的任务点(收尾汇总用)
+        self.skipped_points: list[dict] = []
+        self._skip_lock = threading.Lock()
 
     def login(self, login_with_cookies=False):
         if login_with_cookies:
@@ -693,6 +741,36 @@ class Chaoxing:
         )
         return fresh
 
+    def _mark_skipped(self, course_name: str, job: dict, reason_code: str,
+                      reason: str = "") -> dict:
+        """记下「这个任务点为什么跳过」
+
+        两件事一起做:
+          1. 写进全局记录簿(落盘), 下次运行读到 permanent 条目直接跳过;
+          2. 追加到 `skipped_points`, 收尾时汇总给用户看。
+        """
+        record = {
+            "name": job.get("name"),
+            "jobid": job.get("jobid"),
+            "objectid": job.get("objectid"),
+            "course": course_name,
+            "reason_code": reason_code,
+            "reason": reason,
+            "permanent": reason_code == REASON_FACE_CAPTURE,
+        }
+        lock = getattr(self, "_skip_lock", None)
+        points = getattr(self, "skipped_points", None)
+        if points is None:
+            points = []
+            self.skipped_points = points
+        if lock is not None:
+            with lock:
+                points.append(record)
+        else:
+            points.append(record)
+        record_skip("video", job, reason_code, reason=reason, course=course_name)
+        return record
+
     def _diagnose_stuck_video(self, job: dict, status_json: Optional[dict] = None,
                               reason: str = "") -> dict:
         """把「这个视频为什么刷不过去」写进日志
@@ -737,6 +815,22 @@ class Chaoxing:
             logger.error("[视频诊断] 最近一次上报响应: {}", last_resp[:600])
 
         save_video_debug(f"stuck_{job.get('jobid') or 'unknown'}.json", diag)
+
+        # 判定原因码: 这决定「下次运行还要不要再试」
+        if summary.get("has_face_capture") or has_face_capture(job):
+            reason_code = REASON_FACE_CAPTURE
+        elif summary.get("question_count"):
+            reason_code = REASON_INLINE_QUIZ
+        else:
+            reason_code = REASON_SERVER_REJECT
+        reason_text = reason or summary.get("reason") or ""
+        skip_record = self._mark_skipped(
+            str(getattr(self, "_current_course", "") or ""),
+            job, reason_code,
+            reason=f"{reason_text}" if reason_text else "",
+        )
+        self._last_stuck = skip_record
+
         lock = getattr(self, "_lock_stuck", None)
         points = getattr(self, "stuck_points", None)
         if points is None:
@@ -745,6 +839,7 @@ class Chaoxing:
         record = {
             "name": job.get("name"),
             "reason": summary.get("reason"),
+            "reason_code": reason_code,
             "has_face_capture": summary.get("has_face_capture", False),
             "question_count": summary.get("question_count", 0),
         }
@@ -931,12 +1026,58 @@ class Chaoxing:
         playTime 可能让服务端认为「进度不对」, 于是进度推到片尾也不给通过。
         以往的做法是直接跳过(任务点一直空着), 现在改成从头重播一次 ——
         这比跳到下一节更有用, 代价只是多花一遍视频时长。
+
+        **但有两件事不该重播**:
+          * 开了人脸采集的视频 —— 纯 HTTP 永远过不去, 重播只是白烧一遍时长
+            (15 分钟的视频要真播 15 分钟), 还会把 Actions 时长吃光;
+          * 上次运行已经判定为「重试也没用」的任务点 —— 记录簿里有 permanent 条目。
+        这两种都在播放之前就跳过, 直接让主流程进入本节测验。
         """
+        course_title = str((_course or {}).get("title") or "")
+        self._current_course = course_title
+
+        # 1) 上次运行已经确认「重试也没用」(比如人脸采集) -> 本次直接跳过
+        known = should_skip("video", _job)
+        if known:
+            reason = known.get("reason") or REASON_TEXT.get(REASON_FACE_CAPTURE, "")
+            logger.warning(
+                "[跳过] 该任务点上次已判定为无法自动完成, 本次不再尝试: {} | 原因: {}",
+                _job.get("name"), reason,
+            )
+            self._mark_skipped(course_title, _job,
+                               str(known.get("reason_code") or REASON_FACE_CAPTURE), reason)
+            return StudyResult.SKIPPED
+
+        # 2) 人脸采集: 在播放之前就认出来, 别白播一遍再从头重播一遍
+        if getattr(self, "skip_face_capture", True) and has_face_capture(_job):
+            reason = REASON_TEXT.get(REASON_FACE_CAPTURE, "该视频开启人脸采集")
+            logger.warning(
+                "[跳过] 视频开启了人脸采集, 纯 HTTP 无法通过, 不播放也不重播: {} | {}",
+                _job.get("name"), reason,
+            )
+            logger.warning(
+                "[跳过] 该任务点需要你在网页端/App 里本人过人脸; "
+                "本次跳过它继续做本节测验, 下一节照常进行"
+            )
+            self._mark_skipped(course_title, _job, REASON_FACE_CAPTURE, reason)
+            return StudyResult.SKIPPED
+
+        self._last_stuck = None
         result, stuck = self._study_video_once(
             _course, _job, _job_info, _speed, _type, restart_from_zero=False
         )
         if result == StudyResult.SUCCESS or not stuck:
             return result
+
+        # 卡住的原因是「重播也不会变」的那种, 直接收工, 不重播
+        last = getattr(self, "_last_stuck", None) or {}
+        if last.get("permanent"):
+            logger.warning(
+                "任务点未完成的原因重播也不会改变({}), 本次不重播: {} | {}",
+                last.get("reason_code"), _job.get("name"), last.get("reason"),
+            )
+            return result
+
         if runtime_budget.should_stop():
             logger.warning("任务点未完成, 但已到运行时长上限, 本次不重播: {}", _job.get("name"))
             return result
@@ -1078,6 +1219,11 @@ class Chaoxing:
                         if state == 403:
                             if forbidden_retry >= max_forbidden_retry:
                                 logger.warning("403重试失败, 跳过当前任务")
+                                # 403 多为风控/会话失效, 不是死局: 记下来但标成可重试
+                                self._mark_skipped(
+                                    str(getattr(self, "_current_course", "") or ""),
+                                    _job, REASON_FORBIDDEN, REASON_TEXT.get(REASON_FORBIDDEN, ""),
+                                )
                                 return StudyResult.FORBIDDEN, False
                             forbidden_retry += 1
                             logger.warning(

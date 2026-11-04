@@ -42,6 +42,26 @@ jobs:
         run: | # 安装依赖包
           pip install -r ./requirements.txt 
           
+      - name: 恢复跳过记录(跨运行)
+        uses: actions/cache@v4
+        with:
+          # 记录「哪个任务点做不过去(例如开了人脸采集)」, 下次运行直接跳过,
+          # 不再把同一个视频从头播一遍。key 带 run_id 保证每次都存一份新的,
+          # restore-keys 前缀命中最近一份, 所以记录会一直累积下去。
+          path: skip_registry.json
+          key: skip-registry-${{ github.run_id }}
+          restore-keys: |
+            skip-registry-
+
+      - name: 恢复 AI 答案缓存(跨运行)
+        uses: actions/cache@v4
+        with:
+          # 同一道题不重复问模型, 省钱也省时间
+          path: ai_cache.json
+          key: ai-cache-${{ github.run_id }}
+          restore-keys: |
+            ai-cache-
+
       
       - name: Run main.py
         env:
@@ -58,8 +78,8 @@ jobs:
           #   true / false -> 强制开关
           AUTO_ANSWER: ${{ vars.AUTO_ANSWER }}
           # 可选: 是否让程序代考。
-          #   留空 / true -> 考试也自动做
-          #   false       -> 跳过考试, 只做作业(考试有次数限制, 想自己考就设 false)
+          #   留空 / false -> 不代考(默认, 只做作业, 考试留给你自己)
+          #   true         -> 考试也自动做(考试次数有限, 交了不能改, 谨慎开启)
           ANSWER_EXAM: ${{ vars.ANSWER_EXAM }}
           # 可选: 作业和刷课谁先做 (after / before / both), 默认 after
           #   after  -> 先刷课, 刷完这门再做作业/考试
@@ -69,6 +89,10 @@ jobs:
           # 可选: 设 true 时, 刷不过去的视频会把卡片/状态/上报响应存到 video_debug/
           #   用来区分「弹窗题 / 人脸采集 / 风控」, 排查完记得关掉
           VIDEO_DEBUG: ${{ vars.VIDEO_DEBUG }}
+          # 可选: 开了人脸采集的视频是否直接跳过 (留空 / true -> 跳过, 默认)
+          #   这类视频纯 HTTP 做不过去, 跳过它继续做本节测验比白播一遍划算
+          #   设 false 可以强制照常播一遍, 用来确认是不是误判
+          SKIP_FACE_CAPTURE: ${{ vars.SKIP_FACE_CAPTURE }}
           # 可选: AI 答题是否开启深度思考, 默认开启(更准, 但更慢更费 token)
           #   留空 / true -> 开启
           #   false      -> 关闭, 省 token
@@ -103,12 +127,13 @@ jobs:
             if [ -n "$ANSWER_SUBMIT" ]; then
               args+=(--answer-submit "$ANSWER_SUBMIT")
             fi
-            # 考试开关: 只有明确设成 false/0 才跳过考试
-            if [ "$ANSWER_EXAM" = "false" ] || [ "$ANSWER_EXAM" = "0" ]; then
-              args+=(--no-exam)
-              echo "本次不处理考试, 只做作业"
+            # 考试开关: 默认不代考, 只有明确设成 true/1 才做考试
+            if [ "$ANSWER_EXAM" = "true" ] || [ "$ANSWER_EXAM" = "1" ]; then
+              args+=(--exam)
+              echo "本次连考试一起做(注意考试次数有限)"
             else
-              echo "本次同时处理作业和考试"
+              args+=(--no-exam)
+              echo "本次不处理考试, 只做作业 + 章节测验"
             fi
             # 作业与刷课的先后顺序
             if [ -n "$ANSWER_ORDER" ]; then
@@ -126,6 +151,14 @@ jobs:
           if [ "$VIDEO_DEBUG" = "true" ]; then
             args+=(--video-debug)
             echo "已开启视频诊断, 诊断数据将保存到 video_debug/"
+          fi
+
+          # 人脸采集视频: 默认直接跳过(纯 HTTP 做不过去), 只有明确设 false 才照常播
+          if [ "$SKIP_FACE_CAPTURE" = "false" ] || [ "$SKIP_FACE_CAPTURE" = "0" ]; then
+            args+=(--no-skip-face-capture)
+            echo "本次不跳过人脸采集视频, 会照常播放(用于确认是否为误判)"
+          else
+            echo "本次检测到人脸采集的视频会直接跳过, 不再重播"
           fi
 
           python main.py "${args[@]}"
