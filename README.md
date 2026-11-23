@@ -27,6 +27,6 @@
 <a href="https://github.com/Samueli924/chaoxing" target="blank">灵感来源</a>
 
 ## 赞助
->如果觉着代码对你有帮助，可以赞赏一下
+>如果觉着代码对你有帮助，可以赞赏
 
 ![截图](/images/reward.jpg)
